@@ -150,6 +150,19 @@ func (c *Config) PublicKey() (path, key string, err error) {
 	return "", "", fmt.Errorf("no SSH public key found; set ssh.public_key in %s", c.path)
 }
 
+// IdentityFile returns the private key matching ssh.public_key, if present
+// on disk, so connections work even without a live ssh-agent.
+func (c *Config) IdentityFile() string {
+	if c.SSH.PublicKey == "" {
+		return ""
+	}
+	priv := strings.TrimSuffix(ExpandHome(c.SSH.PublicKey), ".pub")
+	if _, err := os.Stat(priv); err == nil {
+		return priv
+	}
+	return ""
+}
+
 // Credentials resolves provider credentials: environment first, then
 // credentials_file (a KEY=VALUE env file, `export` prefixes allowed).
 func (c *Config) Credentials() (id, secret string, err error) {

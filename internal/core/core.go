@@ -89,6 +89,7 @@ func (a *App) Target(in *provider.Instance) sshx.Target {
 		User:         a.Cfg.SSH.User,
 		Host:         in.IP,
 		ForwardAgent: a.Cfg.ForwardAgent(),
+		IdentityFile: a.Cfg.IdentityFile(),
 	}
 }
 
@@ -323,7 +324,7 @@ func (a *App) Up(ctx context.Context, spec UpSpec) (*provider.Instance, error) {
 	}
 
 	if len(volumes) > 0 {
-		if err := a.mountVolume(ctx, t, volumes[0]); err != nil {
+		if err := a.MountVolume(ctx, t, volumes[0]); err != nil {
 			a.logf("warning: volume mount: %v", err)
 		}
 	}
@@ -358,8 +359,8 @@ func (a *App) waitRunning(ctx context.Context, id string, timeout time.Duration)
 	return nil, fmt.Errorf("instance %s not running after %s", id, timeout)
 }
 
-// mountVolume runs the provider-supplied mkdir/mount commands best-effort.
-func (a *App) mountVolume(ctx context.Context, t sshx.Target, volID string) error {
+// MountVolume runs the provider-supplied mkdir/mount commands best-effort.
+func (a *App) MountVolume(ctx context.Context, t sshx.Target, volID string) error {
 	v, err := a.Prov.GetVolume(ctx, volID)
 	if err != nil {
 		return err

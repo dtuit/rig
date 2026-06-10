@@ -17,6 +17,7 @@ type Target struct {
 	User         string
 	Host         string
 	ForwardAgent bool
+	IdentityFile string // explicit private key; keeps rig working when no agent is alive
 }
 
 func (t Target) addr() string { return t.User + "@" + t.Host }
@@ -33,6 +34,9 @@ func (t Target) baseArgs() []string {
 	}
 	if t.ForwardAgent {
 		args = append(args, "-A")
+	}
+	if t.IdentityFile != "" {
+		args = append(args, "-i", t.IdentityFile)
 	}
 	return args
 }

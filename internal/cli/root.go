@@ -63,6 +63,7 @@ func NewRoot() *cobra.Command {
 
 	root.AddCommand(
 		newUpCmd(),
+		newAdoptCmd(),
 		newDownCmd(),
 		newStatusCmd(),
 		newTypesCmd(),

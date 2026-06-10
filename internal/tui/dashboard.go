@@ -32,13 +32,13 @@ type dashData struct {
 }
 
 type dashModel struct {
-	app      *core.App
-	ctx      context.Context
-	data     dashData
-	cursor   int
-	confirm  string // pending action: "down" or ""
-	flash    string
-	loading  bool
+	app     *core.App
+	ctx     context.Context
+	data    dashData
+	cursor  int
+	confirm string // pending action: "down" or ""
+	flash   string
+	loading bool
 }
 
 type tickMsg time.Time
