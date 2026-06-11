@@ -5,6 +5,7 @@ package sshx
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -18,6 +19,21 @@ type Target struct {
 	Host         string
 	ForwardAgent bool
 	IdentityFile string // explicit private key; keeps rig working when no agent is alive
+	AgentSocket  string // SSH_AUTH_SOCK override (rig-managed agent)
+}
+
+func (t Target) env() []string {
+	if t.AgentSocket == "" {
+		return nil
+	}
+	env := os.Environ()
+	out := env[:0]
+	for _, e := range env {
+		if !strings.HasPrefix(e, "SSH_AUTH_SOCK=") {
+			out = append(out, e)
+		}
+	}
+	return append(out, "SSH_AUTH_SOCK="+t.AgentSocket)
 }
 
 func (t Target) addr() string { return t.User + "@" + t.Host }
@@ -41,17 +57,50 @@ func (t Target) baseArgs() []string {
 	return args
 }
 
+func (t Target) command(name string, args ...string) *exec.Cmd {
+	c := exec.Command(name, args...)
+	if env := t.env(); env != nil {
+		c.Env = env
+	}
+	return c
+}
+
+// EnsureAgent makes sure an ssh-agent listens on socket and holds keys,
+// starting one and loading them if needed. Keys must be passphrase-less.
+func EnsureAgent(socket string, keys []string) error {
+	check := exec.Command("ssh-add", "-l")
+	check.Env = append(os.Environ(), "SSH_AUTH_SOCK="+socket)
+	if err := check.Run(); err != nil {
+		// exit 1 = agent alive but no keys; anything else = no usable agent
+		var ee *exec.ExitError
+		if !(errors.As(err, &ee) && ee.ExitCode() == 1) {
+			os.Remove(socket)
+			if out, err := exec.Command("ssh-agent", "-a", socket).CombinedOutput(); err != nil {
+				return fmt.Errorf("starting ssh-agent: %v: %s", err, out)
+			}
+		}
+	}
+	for _, k := range keys {
+		add := exec.Command("ssh-add", "-q", k)
+		add.Env = append(os.Environ(), "SSH_AUTH_SOCK="+socket)
+		if out, err := add.CombinedOutput(); err != nil {
+			return fmt.Errorf("ssh-add %s: %v: %s", k, err, out)
+		}
+	}
+	return nil
+}
+
 // Run executes cmd on the target and returns combined output.
 func (t Target) Run(cmd string) (string, error) {
 	args := append(t.baseArgs(), t.addr(), cmd)
-	out, err := exec.Command("ssh", args...).CombinedOutput()
+	out, err := t.command("ssh", args...).CombinedOutput()
 	return string(out), err
 }
 
 // RunWithStdin executes cmd on the target feeding stdin.
 func (t Target) RunWithStdin(stdin, cmd string) (string, error) {
 	args := append(t.baseArgs(), t.addr(), cmd)
-	c := exec.Command("ssh", args...)
+	c := t.command("ssh", args...)
 	c.Stdin = bytes.NewBufferString(stdin)
 	out, err := c.CombinedOutput()
 	return string(out), err
@@ -65,7 +114,7 @@ func (t Target) Interactive(extraArgs []string, remoteCmd string) error {
 	if remoteCmd != "" {
 		args = append(args, remoteCmd)
 	}
-	c := exec.Command("ssh", args...)
+	c := t.command("ssh", args...)
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return c.Run()
 }
@@ -73,7 +122,7 @@ func (t Target) Interactive(extraArgs []string, remoteCmd string) error {
 // Stream runs cmd remotely with stdout/stderr attached to ours (non-tty).
 func (t Target) Stream(cmd string) error {
 	args := append(t.baseArgs(), t.addr(), cmd)
-	c := exec.Command("ssh", args...)
+	c := t.command("ssh", args...)
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return c.Run()
 }
@@ -86,7 +135,7 @@ func (t Target) Tunnel(forwards [][2]int) error {
 		args = append(args, "-L", fmt.Sprintf("%d:localhost:%d", f[0], f[1]))
 	}
 	args = append(args, "-N", t.addr())
-	c := exec.Command("ssh", args...)
+	c := t.command("ssh", args...)
 	c.Stdout, c.Stderr = os.Stdout, os.Stderr
 	return c.Run()
 }
@@ -102,7 +151,7 @@ func (t Target) Rsync(src, dest string, excludes []string, delete bool) error {
 		args = append(args, "--delete")
 	}
 	args = append(args, src, t.addr()+":"+dest)
-	c := exec.Command("rsync", args...)
+	c := t.command("rsync", args...)
 	c.Stdout, c.Stderr = os.Stdout, os.Stderr
 	return c.Run()
 }

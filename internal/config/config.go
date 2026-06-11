@@ -11,10 +11,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type Agent struct {
+	Socket string   `yaml:"socket"` // fixed-path agent socket rig starts on demand
+	Keys   []string `yaml:"keys"`   // private keys loaded into it (passphrase-less)
+}
+
 type SSH struct {
 	User         string `yaml:"user"`
 	PublicKey    string `yaml:"public_key"`
 	ForwardAgent *bool  `yaml:"forward_agent"`
+	Agent        *Agent `yaml:"agent"`
 }
 
 type VolumeSpec struct {

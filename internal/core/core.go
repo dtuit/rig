@@ -85,12 +85,25 @@ func (a *App) Resolve(ctx context.Context, key string) (*provider.Instance, erro
 }
 
 func (a *App) Target(in *provider.Instance) sshx.Target {
-	return sshx.Target{
+	t := sshx.Target{
 		User:         a.Cfg.SSH.User,
 		Host:         in.IP,
 		ForwardAgent: a.Cfg.ForwardAgent(),
 		IdentityFile: a.Cfg.IdentityFile(),
 	}
+	if ag := a.Cfg.SSH.Agent; ag != nil && ag.Socket != "" {
+		sock := config.ExpandHome(ag.Socket)
+		keys := make([]string, 0, len(ag.Keys))
+		for _, k := range ag.Keys {
+			keys = append(keys, config.ExpandHome(k))
+		}
+		if err := sshx.EnsureAgent(sock, keys); err != nil {
+			a.logf("warning: rig agent: %v (falling back to ambient SSH_AUTH_SOCK)", err)
+		} else {
+			t.AgentSocket = sock
+		}
+	}
+	return t
 }
 
 // UpSpec is a fully resolved launch request (from a profile or the TUI).
