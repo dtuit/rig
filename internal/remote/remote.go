@@ -145,6 +145,7 @@ func StartJob(t sshx.Target, name, workdir, command string) error {
 		return fmt.Errorf("job name must match %s", nameRe)
 	}
 	script := "#!/bin/bash\n"
+	script += "export PATH=\"$HOME/.local/bin:$PATH\"\n"
 	if workdir != "" {
 		script += fmt.Sprintf("cd %q || exit 1\n", workdir)
 	}
@@ -156,7 +157,7 @@ func StartJob(t sshx.Target, name, workdir, command string) error {
 	}
 	// fresh log/exit per start
 	start := fmt.Sprintf(
-		`rm -f ~/.rig/logs/%[1]s.exit && tmux new-session -d -s rig-%[1]s `+
+		`rm -f ~/.rig/logs/%[1]s.exit && : > ~/.rig/logs/%[1]s.log && tmux new-session -d -s rig-%[1]s `+
 			`'"$HOME"/.rig/jobs/%[1]s.sh >> "$HOME"/.rig/logs/%[1]s.log 2>&1; echo $? > "$HOME"/.rig/logs/%[1]s.exit'`,
 		name)
 	if out, err := t.Run(start); err != nil {

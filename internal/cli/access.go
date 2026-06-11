@@ -99,7 +99,8 @@ func newSyncCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			excludes := []string{".venv", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache"}
+			// .env: per-machine config; syncing one box's paths onto another breaks things
+			excludes := []string{".venv", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache", ".env"}
 			if !includeGit {
 				excludes = append(excludes, ".git")
 			}
