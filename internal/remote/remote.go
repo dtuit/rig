@@ -133,9 +133,9 @@ func PushEnvFile(t sshx.Target, content, base string) error {
 }
 
 type Job struct {
-	Name     string
-	Running  bool
-	ExitCode int // valid when !Running
+	Name     string `json:"name"`
+	Running  bool   `json:"running"`
+	ExitCode int    `json:"exit_code"` // valid when !Running
 }
 
 // StartJob runs command detached in tmux session rig-<name>, logging to

@@ -195,8 +195,13 @@ func ParseEnvFile(path string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ParseEnv(string(data)), nil
+}
+
+// ParseEnv parses KEY=VALUE lines (`export` prefixes and quotes allowed).
+func ParseEnv(data string) map[string]string {
 	out := map[string]string{}
-	for _, line := range strings.Split(string(data), "\n") {
+	for _, line := range strings.Split(data, "\n") {
 		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "export "))
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -207,7 +212,7 @@ func ParseEnvFile(path string) (map[string]string, error) {
 		}
 		out[strings.TrimSpace(k)] = strings.Trim(strings.TrimSpace(v), `"'`)
 	}
-	return out, nil
+	return out
 }
 
 func ExpandHome(p string) string {

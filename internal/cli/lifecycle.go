@@ -12,6 +12,8 @@ import (
 
 	"github.com/dtuit/rig/internal/config"
 	"github.com/dtuit/rig/internal/core"
+	"github.com/dtuit/rig/internal/ledger"
+	"github.com/dtuit/rig/internal/provider"
 	"github.com/dtuit/rig/internal/remote"
 	"github.com/dtuit/rig/internal/tui"
 )
@@ -155,10 +157,12 @@ func newDownCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				if err := a.Down(cmd.Context(), in, delVolumes); err != nil {
+				ev, err := a.Down(cmd.Context(), in, delVolumes)
+				if err != nil {
 					return fmt.Errorf("deleting %s: %w", name, err)
 				}
-				fmt.Printf("%s deleted\n", name)
+				fmt.Printf("%s deleted (lived %.1fh, ~$%.2f)\n", name,
+					float64(ev.LifetimeSecs)/3600, ev.Cost)
 			}
 			return nil
 		},
@@ -169,28 +173,59 @@ func newDownCmd() *cobra.Command {
 	return cmd
 }
 
+// parseExtendArgs accepts the duration positionally (rig extend grid422 8h)
+// or via --by, mirroring how down/logs/stop take their subject (issue 06).
+func parseExtendArgs(args []string, by string, byChanged bool) (key string, d time.Duration, err error) {
+	var positional string
+	switch len(args) {
+	case 2:
+		key, positional = args[0], args[1]
+	case 1:
+		if parsed, perr := time.ParseDuration(args[0]); perr == nil {
+			d = parsed
+			positional = args[0]
+		} else {
+			key = args[0]
+		}
+	}
+	if positional != "" {
+		if byChanged {
+			return "", 0, fmt.Errorf("duration given twice (positional %q and --by %s)", positional, by)
+		}
+		if d == 0 {
+			if d, err = time.ParseDuration(positional); err != nil {
+				return "", 0, fmt.Errorf("bad duration %q (e.g. 8h, or use --by)", positional)
+			}
+		}
+		return key, d, nil
+	}
+	if d, err = time.ParseDuration(by); err != nil {
+		return "", 0, fmt.Errorf("bad --by: %w", err)
+	}
+	return key, d, nil
+}
+
 func newExtendCmd() *cobra.Command {
 	var by string
 	cmd := &cobra.Command{
-		Use:   "extend [name]",
+		Use:   "extend [name] [duration]",
 		Short: "Push out the self-destruct deadline",
-		Args:  cobra.MaximumNArgs(1),
+		Args:  cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			a, err := newApp()
 			if err != nil {
 				return err
 			}
-			key := instanceFlag
-			if len(args) == 1 {
-				key = args[0]
+			key, d, err := parseExtendArgs(args, by, cmd.Flags().Changed("by"))
+			if err != nil {
+				return err
+			}
+			if key == "" {
+				key = instanceFlag
 			}
 			in, err := a.Resolve(cmd.Context(), key)
 			if err != nil {
 				return err
-			}
-			d, err := time.ParseDuration(by)
-			if err != nil {
-				return fmt.Errorf("bad --by: %w", err)
 			}
 			t := a.Target(in)
 			base := time.Now()
@@ -201,6 +236,9 @@ func newExtendCmd() *cobra.Command {
 			if err := remote.SetDeadline(t, deadline); err != nil {
 				return err
 			}
+			if err := ledger.Append(ledger.Path(), ledger.ExtendEvent(in, deadline, time.Now())); err != nil {
+				fmt.Fprintf(os.Stderr, "rig: warning: spend ledger: %v\n", err)
+			}
 			fmt.Printf("%s self-destructs %s (in %s)\n", in.Name,
 				deadline.Format("Mon 15:04"), time.Until(deadline).Round(time.Minute))
 			return nil
@@ -208,6 +246,13 @@ func newExtendCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&by, "by", "6h", "extend by this duration")
 	return cmd
+}
+
+// statusRow is the existing instance struct plus the computed TTL the human
+// table already shows (ADR-0002).
+type statusRow struct {
+	provider.Instance
+	TTL string `json:"ttl"`
 }
 
 func newStatusCmd() *cobra.Command {
@@ -224,13 +269,7 @@ func newStatusCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if len(instances) == 0 {
-				fmt.Println("no rig instances")
-				return nil
-			}
-			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "NAME\tSTATUS\tTYPE\tIP\tLOC\t$/H\tAGE\tTTL")
-			var burn float64
+			rows := make([]statusRow, 0, len(instances))
 			for _, in := range instances {
 				ttl := "-"
 				if in.Status == "running" && in.IP != "" {
@@ -238,13 +277,27 @@ func newStatusCmd() *cobra.Command {
 						ttl = time.Until(dl).Round(time.Minute).String()
 					}
 				}
+				rows = append(rows, statusRow{Instance: in, TTL: ttl})
+			}
+			if jsonFlag {
+				return renderJSON(rows)
+			}
+			if len(rows) == 0 {
+				fmt.Println("no rig instances")
+				return nil
+			}
+			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+			fmt.Fprintln(w, "NAME\tSTATUS\tTYPE\tIP\tLOC\t$/H\tAGE\tTTL")
+			var burn float64
+			for _, r := range rows {
+				in := r.Instance
 				price := fmt.Sprintf("%.2f%s", in.PricePerHour, spotTag(in.Spot))
 				if in.Status == "running" {
 					burn += in.PricePerHour
 				}
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 					strings.TrimPrefix(in.Name, core.HostPrefix), in.Status, in.Type,
-					in.IP, in.Location, price, age(in.CreatedAt), ttl)
+					in.IP, in.Location, price, age(in.CreatedAt), r.TTL)
 			}
 			w.Flush()
 			if burn > 0 {

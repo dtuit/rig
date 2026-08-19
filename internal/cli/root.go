@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -16,6 +17,7 @@ import (
 var (
 	app          *core.App
 	instanceFlag string
+	jsonFlag     bool
 )
 
 func newApp() (*core.App, error) {
@@ -60,12 +62,14 @@ func NewRoot() *cobra.Command {
 		},
 	}
 	root.PersistentFlags().StringVarP(&instanceFlag, "instance", "i", "", "target instance name or ID prefix")
+	root.PersistentFlags().BoolVar(&jsonFlag, "json", false, "machine-readable output (status, ps, types, volumes, spend)")
 
 	root.AddCommand(
 		newUpCmd(),
 		newAdoptCmd(),
 		newDownCmd(),
 		newStatusCmd(),
+		newSpendCmd(),
 		newTypesCmd(),
 		newImagesCmd(),
 		newVolumesCmd(),
@@ -73,7 +77,9 @@ func NewRoot() *cobra.Command {
 		newSSHCmd(),
 		newTunnelCmd(),
 		newSyncCmd(),
+		newFetchCmd(),
 		newRunCmd(),
+		newWaitCmd(),
 		newPsCmd(),
 		newLogsCmd(),
 		newStopCmd(),
@@ -82,9 +88,25 @@ func NewRoot() *cobra.Command {
 	return root
 }
 
+// exitError carries a specific process exit code out of a RunE; Execute
+// unwraps it instead of the blanket exit 1. An empty msg exits silently —
+// used when the underlying command already wrote its own stderr.
+type exitError struct {
+	code int
+	msg  string
+}
+
+func (e exitError) Error() string { return e.msg }
+
 func Execute() {
 	if err := NewRoot().Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, "rig:", err)
+		if err.Error() != "" {
+			fmt.Fprintln(os.Stderr, "rig:", err)
+		}
+		var ee exitError
+		if errors.As(err, &ee) {
+			os.Exit(ee.code)
+		}
 		os.Exit(1)
 	}
 }

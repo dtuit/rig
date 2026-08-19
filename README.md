@@ -56,18 +56,27 @@ rig status               # table: status, IP, $/h, age, time-to-self-destruct
 rig types --available    # what can actually be deployed right now
 rig ssh [-- cmd]         # interactive shell or one-off command (agent forwarded)
 rig sync ~/code/project    # rsync a working tree to the box
+rig sync data --exclude images/          # skip subtrees (repeatable, stacks on defaults)
+rig fetch s3://bucket/set.tar            # download ON the instance, not through your machine
 rig tunnel 8000 50051    # forward local ports (^C to stop)
 
 rig run --name train -- bash train.sh   # detached tmux job, survives disconnect
 rig ps                   # running / exited jobs
 rig logs train -f        # follow the job log
+rig wait train           # block until it finishes; exit with ITS exit code (124 = --timeout)
+rig run --wait -- bash train.sh          # start + wait in one command
 rig stop train           # kill a job
 
-rig extend --by 6h       # push out the self-destruct deadline
-rig down                 # delete instance (+ its OS volume); data volumes kept
+rig extend 6h            # push out the self-destruct deadline (or: rig extend <name> 6h)
+rig down                 # delete instance (+ its OS volume); prints lifetime + cost
 rig down --delete-volumes  # ... and destroy data volumes too
 rig volumes              # list volumes; --rm <name> deletes a detached one
+rig spend --since 168h   # spend summary from the local ledger (advisory)
 ```
+
+`rig ssh -- <cmd>` exits with the remote command's exit code; 255 means ssh
+itself failed *or* the remote command killed its own connection (e.g. a bare
+`pkill`), so don't chain on commands that tear down their own session.
 
 ## How it holds together
 
@@ -90,23 +99,31 @@ rig volumes              # list volumes; --rm <name> deletes a detached one
   session, logs to `~/.rig/logs/<name>.log`, records the exit code, and
   sources every file in `~/.rig/env/` first. Nothing depends on your laptop
   staying connected.
-- **No credentials at rest on instances.** SSH agent forwarding handles
-  private git dependencies (`git+ssh` installs); secrets arrive only as
-  explicitly pushed env files.
-- **No local state.** Everything is derived from the provider API; rig
-  instances are recognized by the `rig-` hostname prefix. (Note: on a shared
-  cloud account, that prefix — and instance names — are global to the team.)
+- **No long-lived credentials at rest on instances.** SSH agent forwarding
+  handles private git dependencies (`git+ssh` installs); secrets arrive only
+  as explicitly pushed env files. `rig fetch s3://…` forwards short-lived
+  session credentials (minting them via STS when your local key is
+  long-lived) to the one remote command over stdin — nothing persists.
+- **(Almost) no local state.** Everything is derived from the provider API;
+  rig instances are recognized by the `rig-` hostname prefix. (Note: on a
+  shared cloud account, that prefix — and instance names — are global to the
+  team.) The one exception is the spend ledger (`~/.config/rig/ledger.jsonl`),
+  an advisory append-only record behind `rig spend`; the provider's billing
+  stays authoritative, and TTL-torn instances appear as estimates.
 
 ## Agent orchestration
 
-Every command is non-interactive when fully specified, which makes rig
-drivable by an AI agent end-to-end:
+Every command is non-interactive when fully specified, and the read commands
+(`status`, `ps`, `types`, `volumes`, `spend`) take a `--json` flag, which
+makes rig drivable by an AI agent end-to-end — no table scraping, no log
+watching:
 
 ```bash
 rig up train                          # blocks until ssh is ready
 rig sync ~/code/project
-rig run --name exp42 -- bash provision/train.sh
-rig logs exp42 -f                     # poll progress
+rig fetch s3://bucket/dataset.tar --dest /data/
+rig run --wait --name exp42 -- bash provision/train.sh   # blocks; exits with the job's code
+rig status --json | jq -r '.[0].ttl'  # machine-readable everything
 rig down --yes                        # tear down when done
 ```
 

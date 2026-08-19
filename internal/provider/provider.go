@@ -8,43 +8,43 @@ import (
 )
 
 type Instance struct {
-	ID           string
-	Name         string // hostname
-	Type         string
-	Status       string
-	IP           string
-	Location     string
-	Spot         bool
-	PricePerHour float64
-	CreatedAt    time.Time
-	VolumeIDs    []string
-	OSVolumeID   string
-	GPU          string
-	Image        string
+	ID           string    `json:"id"`
+	Name         string    `json:"name"` // hostname
+	Type         string    `json:"type"`
+	Status       string    `json:"status"`
+	IP           string    `json:"ip"`
+	Location     string    `json:"location"`
+	Spot         bool      `json:"spot"`
+	PricePerHour float64   `json:"price_per_hour"`
+	CreatedAt    time.Time `json:"created_at"`
+	VolumeIDs    []string  `json:"volume_ids"`
+	OSVolumeID   string    `json:"os_volume_id"`
+	GPU          string    `json:"gpu"`
+	Image        string    `json:"image"`
 }
 
 type InstanceType struct {
-	Type         string
-	GPU          string
-	GPUCount     int
-	GPUMemoryGB  int
-	MemoryGB     int
-	CPUCount     int
-	PricePerHour float64
-	SpotPrice    float64
-	Description  string
+	Type         string  `json:"type"`
+	GPU          string  `json:"gpu"`
+	GPUCount     int     `json:"gpu_count"`
+	GPUMemoryGB  int     `json:"gpu_memory_gb"`
+	MemoryGB     int     `json:"memory_gb"`
+	CPUCount     int     `json:"cpu_count"`
+	PricePerHour float64 `json:"price_per_hour"`
+	SpotPrice    float64 `json:"spot_price"`
+	Description  string  `json:"description"`
 }
 
 type Volume struct {
-	ID           string
-	Name         string
-	SizeGB       int
-	Type         string
-	Status       string
-	Location     string
-	InstanceIDs  []string
-	MountCommand string
-	MkdirCommand string
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	SizeGB       int      `json:"size_gb"`
+	Type         string   `json:"type"`
+	Status       string   `json:"status"`
+	Location     string   `json:"location"`
+	InstanceIDs  []string `json:"instance_ids"`
+	MountCommand string   `json:"mount_command"`
+	MkdirCommand string   `json:"mkdir_command"`
 }
 
 func (v Volume) IsAttached() bool { return len(v.InstanceIDs) > 0 }

@@ -127,6 +127,16 @@ func (t Target) Stream(cmd string) error {
 	return c.Run()
 }
 
+// StreamWithStdin runs cmd remotely with our stdout/stderr, feeding stdin —
+// used to hand a command secrets without putting them on argv or disk.
+func (t Target) StreamWithStdin(stdin, cmd string) error {
+	args := append(t.baseArgs(), t.addr(), cmd)
+	c := t.command("ssh", args...)
+	c.Stdin = bytes.NewBufferString(stdin)
+	c.Stdout, c.Stderr = os.Stdout, os.Stderr
+	return c.Run()
+}
+
 // Tunnel opens local port forwards and blocks until interrupted.
 // forwards entries are "local:remote" port pairs.
 func (t Target) Tunnel(forwards [][2]int) error {

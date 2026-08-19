@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -11,10 +13,26 @@ import (
 	"github.com/dtuit/rig/internal/config"
 )
 
+// propagateExit turns a subprocess exit status into rig's own exit code
+// (issue 07): rig ssh -- <cmd> exits with the remote command's code. The
+// message stays empty — the remote command already wrote its own stderr.
+func propagateExit(err error) error {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() > 0 {
+		return exitError{code: ee.ExitCode()}
+	}
+	return err
+}
+
 func newSSHCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "ssh [-- cmd ...]",
 		Short: "SSH into the instance (agent forwarding on)",
+		Long: `Opens an interactive session, or runs the given command and exits with
+its exit code — so "rig ssh -- test -f done && next" works. Exit 255 means
+ssh itself failed (unreachable instance) OR the remote command tore down its
+own connection (e.g. pkill on its process tree); don't chain on commands
+that kill their own session.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			a, err := newApp()
 			if err != nil {
@@ -24,7 +42,7 @@ func newSSHCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return a.Target(in).Interactive(nil, strings.Join(args, " "))
+			return propagateExit(a.Target(in).Interactive(nil, strings.Join(args, " ")))
 		},
 	}
 	return cmd
@@ -80,11 +98,24 @@ func newTunnelCmd() *cobra.Command {
 	return cmd
 }
 
+// syncExcludes returns the rsync exclude patterns: the defaults (per-machine
+// state that must not cross instances) always apply, user patterns stack on
+// top.
+func syncExcludes(includeGit bool, extra []string) []string {
+	// .env: local config; syncing one environment's paths onto another breaks things
+	excludes := []string{".venv", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache", ".env"}
+	if !includeGit {
+		excludes = append(excludes, ".git")
+	}
+	return append(excludes, extra...)
+}
+
 func newSyncCmd() *cobra.Command {
 	var (
 		dest       string
 		del        bool
 		includeGit bool
+		excludes   []string
 	)
 	cmd := &cobra.Command{
 		Use:   "sync <local-path> [more-paths...]",
@@ -99,11 +130,6 @@ func newSyncCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// .env: per-machine config; syncing one box's paths onto another breaks things
-			excludes := []string{".venv", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache", ".env"}
-			if !includeGit {
-				excludes = append(excludes, ".git")
-			}
 			t := a.Target(in)
 			for _, src := range args {
 				src = strings.TrimSuffix(config.ExpandHome(src), "/")
@@ -112,7 +138,7 @@ func newSyncCmd() *cobra.Command {
 					d = "~/" + filepath.Base(src)
 				}
 				fmt.Printf("sync %s -> %s:%s\n", src, in.Name, d)
-				if err := t.Rsync(src+"/", d+"/", excludes, del); err != nil {
+				if err := t.Rsync(src+"/", d+"/", syncExcludes(includeGit, excludes), del); err != nil {
 					return err
 				}
 			}
@@ -122,5 +148,6 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().StringVar(&dest, "dest", "", "remote destination (default ~/<basename>)")
 	cmd.Flags().BoolVar(&del, "delete", false, "delete remote files not present locally")
 	cmd.Flags().BoolVar(&includeGit, "include-git", false, "also sync .git directories")
+	cmd.Flags().StringArrayVar(&excludes, "exclude", nil, "rsync exclude pattern, repeatable (stacks on the defaults)")
 	return cmd
 }

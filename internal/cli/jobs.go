@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -15,15 +16,22 @@ func newRunCmd() *cobra.Command {
 	var (
 		name    string
 		workdir string
+		wait    bool
+		timeout time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "run -- <command ...>",
 		Short: "Run a command detached on the instance (survives disconnect)",
 		Long: `Runs the command in a named tmux session on the instance, logging to
 ~/.rig/logs/<name>.log and recording the exit code. Watch it with
-rig logs <name> -f, list with rig ps, kill with rig stop <name>.`,
+rig logs <name> -f, list with rig ps, kill with rig stop <name>.
+With --wait, blocks until the job finishes and exits with its exit code
+(equivalent to rig run followed by rig wait).`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if timeout != 0 && !wait {
+				return fmt.Errorf("--timeout requires --wait")
+			}
 			a, err := newApp()
 			if err != nil {
 				return err
@@ -36,15 +44,21 @@ rig logs <name> -f, list with rig ps, kill with rig stop <name>.`,
 			if name == "" {
 				name = jobNameFrom(args)
 			}
-			if err := remote.StartJob(a.Target(in), name, workdir, command); err != nil {
+			t := a.Target(in)
+			if err := remote.StartJob(t, name, workdir, command); err != nil {
 				return err
 			}
 			fmt.Printf("job %q started on %s\n  rig logs %s -f\n", name, in.Name, name)
+			if wait {
+				return waitJob(t, name, timeout)
+			}
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "job name (default: derived from command)")
 	cmd.Flags().StringVar(&workdir, "workdir", "", "remote working directory")
+	cmd.Flags().BoolVar(&wait, "wait", false, "block until the job finishes; exit with its exit code")
+	cmd.Flags().DurationVar(&timeout, "timeout", 0, "with --wait: give up after this long and exit 124")
 	return cmd
 }
 
@@ -82,6 +96,9 @@ func newPsCmd() *cobra.Command {
 			jobs, err := remote.ListJobs(a.Target(in))
 			if err != nil {
 				return err
+			}
+			if jsonFlag {
+				return renderJSON(jobs)
 			}
 			if len(jobs) == 0 {
 				fmt.Println("no jobs")

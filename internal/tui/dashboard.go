@@ -120,7 +120,7 @@ func (m dashModel) doAction(action string) tea.Cmd {
 	return func() tea.Msg {
 		switch action {
 		case "down":
-			if err := app.Down(ctx, &in, false); err != nil {
+			if _, err := app.Down(ctx, &in, false); err != nil {
 				return dashData{err: err}
 			}
 		}

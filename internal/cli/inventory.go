@@ -8,7 +8,16 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+
+	"github.com/dtuit/rig/internal/provider"
 )
+
+// typeRow is the existing instance-type struct plus the computed availability
+// column the human table already shows (ADR-0002).
+type typeRow struct {
+	provider.InstanceType
+	Available []string `json:"available"`
+}
 
 func newTypesCmd() *cobra.Command {
 	var (
@@ -38,8 +47,7 @@ func newTypesCmd() *cobra.Command {
 					where[t] = append(where[t], loc)
 				}
 			}
-			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "TYPE\tGPU\tMEM\t$/H\tSPOT$/H\tAVAILABLE")
+			rows := []typeRow{}
 			for _, t := range types {
 				locs := where[t.Type]
 				if availOnly && len(locs) == 0 {
@@ -49,12 +57,20 @@ func newTypesCmd() *cobra.Command {
 					continue
 				}
 				slices.Sort(locs)
-				availStr := strings.Join(locs, ",")
+				rows = append(rows, typeRow{InstanceType: t, Available: locs})
+			}
+			if jsonFlag {
+				return renderJSON(rows)
+			}
+			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+			fmt.Fprintln(w, "TYPE\tGPU\tMEM\t$/H\tSPOT$/H\tAVAILABLE")
+			for _, r := range rows {
+				availStr := strings.Join(r.Available, ",")
 				if availStr == "" {
 					availStr = "-"
 				}
 				fmt.Fprintf(w, "%s\t%s\t%dGB\t%.2f\t%.2f\t%s\n",
-					t.Type, t.GPU, t.MemoryGB, t.PricePerHour, t.SpotPrice, availStr)
+					r.Type, r.GPU, r.MemoryGB, r.PricePerHour, r.SpotPrice, availStr)
 			}
 			return w.Flush()
 		},
@@ -112,6 +128,9 @@ func newVolumesCmd() *cobra.Command {
 			vols, err := a.Prov.ListVolumes(cmd.Context())
 			if err != nil {
 				return err
+			}
+			if jsonFlag && !rm {
+				return renderJSON(vols)
 			}
 			if rm {
 				if len(args) != 1 {

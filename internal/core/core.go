@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dtuit/rig/internal/config"
+	"github.com/dtuit/rig/internal/ledger"
 	"github.com/dtuit/rig/internal/provider"
 	"github.com/dtuit/rig/internal/remote"
 	"github.com/dtuit/rig/internal/sshx"
@@ -341,6 +342,9 @@ func (a *App) Up(ctx context.Context, spec UpSpec) (*provider.Instance, error) {
 			a.logf("warning: volume mount: %v", err)
 		}
 	}
+	if err := ledger.Append(ledger.Path(), ledger.UpEvent(in, spec.TTL, time.Now())); err != nil {
+		a.logf("warning: spend ledger: %v", err)
+	}
 	return in, nil
 }
 
@@ -395,8 +399,9 @@ func (a *App) MountVolume(ctx context.Context, t sshx.Target, volID string) erro
 
 // Down deletes the instance and its OS volume (worthless without the
 // instance, but billed if left behind). Data volumes are kept unless
-// deleteVolumes.
-func (a *App) Down(ctx context.Context, in *provider.Instance, deleteVolumes bool) error {
+// deleteVolumes. The returned event is the ledger record — lifetime and
+// cost — so callers report the same numbers the ledger keeps.
+func (a *App) Down(ctx context.Context, in *provider.Instance, deleteVolumes bool) (ledger.Event, error) {
 	volIDs := []string{}
 	if in.OSVolumeID != "" {
 		volIDs = append(volIDs, in.OSVolumeID)
@@ -408,5 +413,12 @@ func (a *App) Down(ctx context.Context, in *provider.Instance, deleteVolumes boo
 			}
 		}
 	}
-	return a.Prov.DeleteInstance(ctx, in.ID, volIDs)
+	if err := a.Prov.DeleteInstance(ctx, in.ID, volIDs); err != nil {
+		return ledger.Event{}, err
+	}
+	ev := ledger.DownEvent(in, time.Now())
+	if err := ledger.Append(ledger.Path(), ev); err != nil {
+		a.logf("warning: spend ledger: %v", err)
+	}
+	return ev, nil
 }

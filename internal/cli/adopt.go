@@ -2,10 +2,12 @@ package cli
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dtuit/rig/internal/ledger"
 	"github.com/dtuit/rig/internal/remote"
 )
 
@@ -44,6 +46,14 @@ func newAdoptCmd() *cobra.Command {
 			}
 			if err := remote.Init(t, d); err != nil {
 				return err
+			}
+			// adopted instances would otherwise be invisible to rig spend
+			start := in.CreatedAt
+			if start.IsZero() {
+				start = time.Now()
+			}
+			if err := ledger.Append(ledger.Path(), ledger.UpEvent(in, d, start)); err != nil {
+				fmt.Fprintf(os.Stderr, "rig: warning: spend ledger: %v\n", err)
 			}
 			fmt.Printf("%s adopted: TTL %s\n", in.Name, d)
 			for _, volID := range in.VolumeIDs {
