@@ -135,6 +135,8 @@ names `--by` instead of the generic cobra arity error. Low effort, removes a gua
 
 *Where.* `internal/cli/lifecycle.go:175`.
 
+*Darren: We should do a CLI audit to verify that there are no other inconsistencies like this.*
+
 ### 07 — decide and document the exit-status contract for `rig ssh -- <cmd>`
 
 *Problem.* `rig ssh -- 'pkill -f something'` exits 255, because the remote command tears down its own
