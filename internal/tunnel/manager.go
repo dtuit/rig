@@ -94,11 +94,9 @@ func (m *Manager) Ensure(ep Endpoint, forwards []Forward) (State, bool, error) {
 	kept := live[:0]
 	for _, st := range live {
 		if st.Instance == ep.Instance && st.Endpoint != ep {
-			_ = m.Stop(st.PID)
-			for i := 0; m.Alive(st.PID) && i < 50; i++ {
-				m.sleep(m.poll)
+			if err := m.stopAndReap(st); err != nil {
+				return State{}, false, fmt.Errorf("replacing stale tunnel: %w", err)
 			}
-			os.Remove(st.statePath(m.Dir))
 			continue
 		}
 		kept = append(kept, st)
@@ -159,4 +157,58 @@ func (m *Manager) Ensure(ep Endpoint, forwards []Forward) (State, bool, error) {
 		}
 		m.sleep(m.poll)
 	}
+}
+
+// stopAndReap terminates a supervisor and waits out its death (bounded) —
+// its ssh child releases the local ports only then — before removing its
+// state file. A supervisor that outlives the wait is an error: its ports
+// are still held, so the desired state was not reached.
+func (m *Manager) stopAndReap(st State) error {
+	if err := m.Stop(st.PID); err != nil {
+		return fmt.Errorf("stopping supervisor %d for %s: %w", st.PID, st.Instance, err)
+	}
+	for i := 0; m.Alive(st.PID) && i < 50; i++ {
+		m.sleep(m.poll)
+	}
+	if m.Alive(st.PID) {
+		return fmt.Errorf("supervisor %d for %s did not exit", st.PID, st.Instance)
+	}
+	os.Remove(st.statePath(m.Dir))
+	return nil
+}
+
+// StopInstance stops the instance's detached tunnels — all of them, or only
+// the supervisors covering the given local ports — and returns what it
+// stopped. Stopping what is already stopped is success: no matching tunnel
+// means the desired state is already reached.
+func (m *Manager) StopInstance(instance string, ports []int) ([]State, error) {
+	m.init()
+	live, err := m.List()
+	if err != nil {
+		return nil, err
+	}
+	covers := func(st State) bool {
+		if len(ports) == 0 {
+			return true
+		}
+		for _, f := range st.Forwards {
+			for _, p := range ports {
+				if f.Local == p {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	var stopped []State
+	for _, st := range live {
+		if st.Instance != instance || !covers(st) {
+			continue
+		}
+		if err := m.stopAndReap(st); err != nil {
+			return stopped, err
+		}
+		stopped = append(stopped, st)
+	}
+	return stopped, nil
 }

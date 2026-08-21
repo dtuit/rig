@@ -8,19 +8,33 @@ a failure to stop warns but never blocks the down.
 
 **Blocked by:** 02 — detach/ensure.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] `rig tunnel stop` (no ports) stops every tunnel for the resolved instance; supervisor and
+- [x] `rig tunnel stop` (no ports) stops every tunnel for the resolved instance; supervisor and
       ssh child both terminate and the state files are removed.
-- [ ] `rig tunnel stop <port…>` stops only the matching tunnels, leaving others running.
-- [ ] Stopping when nothing is running exits 0.
-- [ ] `rig down` stops the instance's tunnels before/alongside deletion; tunnel-stop failure is a
+- [x] `rig tunnel stop <port…>` stops only the matching tunnels, leaving others running.
+- [x] Stopping when nothing is running exits 0.
+- [x] `rig down` stops the instance's tunnels before/alongside deletion; tunnel-stop failure is a
       warning, not an error.
-- [ ] Stop honors rig's exit-code convention: 0 for reached-desired-state, non-zero with a
+- [x] Stop honors rig's exit-code convention: 0 for reached-desired-state, non-zero with a
       message otherwise.
-- [ ] Manager-level behavior covered through the injected launcher seam (no real ssh in tests).
+- [x] Manager-level behavior covered through the injected launcher seam (no real ssh in tests).
 
 ## Notes
 
 Spec: ../spec.md — see "Stop semantics" and "`rig down` integration". Can run in parallel with
 ticket 03 once 02 lands.
+
+## Comments
+
+2026-08-21 (agent): implemented. `Manager.StopInstance(instance, ports)` stops matching
+supervisors via the shared `stopAndReap` (SIGTERM, bounded wait for death so the ssh child has
+released the ports, state file removed; a supervisor that outlives the wait is a non-zero
+error, and ensure's stale-replacement path now shares this contract instead of racing the old
+child). One deliberate deviation from "existing resolution rules": `rig tunnel stop` resolves
+against the recorded tunnel state (name or ID prefix, sole-instance fallback) with no provider
+call — so ports can be released after the instance is gone or the provider is unreachable,
+which is the story-10 cleanup case. Stopping what is already stopped exits 0. `rig down` calls
+the stop best-effort *before* deletion (per spec "before/alongside"; a stop failure warns,
+never blocks). Verified live: stop by bare name, by ID prefix, idempotent re-stop, port
+released.

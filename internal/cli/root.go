@@ -61,7 +61,7 @@ func NewRoot() *cobra.Command {
 		},
 	}
 	root.PersistentFlags().StringVarP(&instanceFlag, "instance", "i", "", "target instance name or ID prefix")
-	root.PersistentFlags().BoolVar(&jsonFlag, "json", false, "machine-readable output (status, ps, types, volumes, spend)")
+	root.PersistentFlags().BoolVar(&jsonFlag, "json", false, "machine-readable output (status, ps, types, volumes, spend, tunnel status)")
 
 	root.AddCommand(
 		newUpCmd(),

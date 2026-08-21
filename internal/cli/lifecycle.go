@@ -157,6 +157,7 @@ func newDownCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
+				stopTunnelsBestEffort(in.Name)
 				ev, err := a.Down(cmd.Context(), in, delVolumes)
 				if err != nil {
 					return fmt.Errorf("deleting %s: %w", name, err)

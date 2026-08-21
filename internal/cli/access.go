@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
@@ -84,8 +86,8 @@ Foreground by default: blocks until ^C.
 the forwards are actually usable — exit 0 means the ports work now.
 Idempotent: re-ensuring a live tunnel is a no-op, so it is safe to run at
 the start of any workflow. A local port already forwarded elsewhere is
-refused. Stop a detached tunnel by killing its printed supervisor pid;
-state and logs live beside rig's config.`,
+refused. Verify with "rig tunnel status" (--json for machines), release
+with "rig tunnel stop"; state and logs live beside rig's config.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			a, err := newApp()
 			if err != nil {
@@ -138,7 +140,160 @@ state and logs live beside rig's config.`,
 		},
 	}
 	cmd.Flags().BoolVar(&detach, "detach", false, "ensure a supervised background tunnel; exit 0 once the forwards are usable (idempotent)")
+	cmd.AddCommand(newTunnelStatusCmd(), newTunnelStopCmd())
 	return cmd
+}
+
+// forwardsDesc renders a tunnel's forwards compactly: "8000,9090->80".
+func forwardsDesc(st tunnel.State) string {
+	var parts []string
+	for _, f := range st.Forwards {
+		if f.Local == f.Remote {
+			parts = append(parts, strconv.Itoa(f.Local))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d->%d", f.Local, f.Remote))
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
+func newTunnelStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "List detached tunnels (instance, forwards, health, supervisor)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			m := &tunnel.Manager{Dir: tunnel.Dir()}
+			states, err := m.List()
+			if err != nil {
+				return err
+			}
+			return renderTunnels(states)
+		},
+	}
+}
+
+// renderTunnels is the render half of the gather/render seam: the listed
+// states go to exactly one renderer — the structs themselves as JSON
+// (ADR-0002), or the human table.
+func renderTunnels(states []tunnel.State) error {
+	if jsonFlag {
+		return renderJSON(states)
+	}
+	if len(states) == 0 {
+		fmt.Println("no detached tunnels")
+		return nil
+	}
+	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "INSTANCE\tIP\tFORWARDS\tPHASE\tPID\tAGE")
+	for _, st := range states {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n",
+			strings.TrimPrefix(st.Instance, core.HostPrefix), st.IP,
+			forwardsDesc(st), st.Phase, st.PID, age(st.StartedAt))
+	}
+	return w.Flush()
+}
+
+// resolveTunnelInstance picks which instance's tunnels a stop targets, from
+// local state alone — no provider call, so releasing ports still works when
+// the instance is already gone or the provider is unreachable. An empty
+// result with no error means nothing is running: already the desired state.
+func resolveTunnelInstance(states []tunnel.State, key string) (string, error) {
+	if key != "" {
+		full := key
+		if !strings.HasPrefix(key, core.HostPrefix) {
+			full = core.HostPrefix + key
+		}
+		// honor -i's name-or-ID-prefix contract against the recorded state
+		for _, st := range states {
+			if st.Instance == full || strings.HasPrefix(st.ID, key) {
+				return st.Instance, nil
+			}
+		}
+		return full, nil // no live tunnel for it: stop becomes a no-op
+	}
+	seen := map[string]bool{}
+	var names []string
+	for _, st := range states {
+		if !seen[st.Instance] {
+			seen[st.Instance] = true
+			names = append(names, st.Instance)
+		}
+	}
+	switch len(names) {
+	case 0:
+		return "", nil
+	case 1:
+		return names[0], nil
+	default:
+		var short []string
+		for _, n := range names {
+			short = append(short, strings.TrimPrefix(n, core.HostPrefix))
+		}
+		return "", fmt.Errorf("tunnels to multiple instances (%s); pick one with -i", strings.Join(short, ", "))
+	}
+}
+
+func newTunnelStopCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "stop [port ...]",
+		Short: "Stop the instance's detached tunnels (all, or just these local ports)",
+		Long: `Stops the resolved instance's detached tunnels — every one of them, or
+only the supervisors covering the given local ports. Stopping what is
+already stopped is success, so the command is idempotent like ensure.
+Resolution uses the recorded tunnel state, not the provider: ports can be
+released even after the instance is gone.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var ports []int
+			for _, arg := range args {
+				p, err := strconv.Atoi(arg)
+				if err != nil {
+					return fmt.Errorf("bad port %q", arg)
+				}
+				ports = append(ports, p)
+			}
+			m := &tunnel.Manager{Dir: tunnel.Dir()}
+			states, err := m.List()
+			if err != nil {
+				return err
+			}
+			instance, err := resolveTunnelInstance(states, instanceFlag)
+			if err != nil {
+				return err
+			}
+			if instance == "" {
+				fmt.Println("no detached tunnels to stop")
+				return nil
+			}
+			stopped, err := m.StopInstance(instance, ports)
+			reportStopped(stopped)
+			if err != nil {
+				return err
+			}
+			if len(stopped) == 0 {
+				fmt.Println("no detached tunnels to stop")
+			}
+			return nil
+		},
+	}
+}
+
+func reportStopped(stopped []tunnel.State) {
+	for _, st := range stopped {
+		fmt.Printf("stopped tunnel to %s (%s)\n",
+			strings.TrimPrefix(st.Instance, core.HostPrefix), forwardsDesc(st))
+	}
+}
+
+// stopTunnelsBestEffort releases an instance's detached tunnels for rig
+// down: a failure warns but never blocks the teardown.
+func stopTunnelsBestEffort(name string) {
+	m := &tunnel.Manager{Dir: tunnel.Dir()}
+	stopped, err := m.StopInstance(name, nil)
+	reportStopped(stopped)
+	if err != nil {
+		stderrLogf("warning: stopping tunnels for %s: %v", name, err)
+	}
 }
 
 // newTunnelSuperviseCmd is the hidden supervisor entry point --detach
