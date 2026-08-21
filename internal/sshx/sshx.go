@@ -137,15 +137,27 @@ func (t Target) StreamWithStdin(stdin, cmd string) error {
 	return c.Run()
 }
 
-// Tunnel opens local port forwards and blocks until interrupted.
-// forwards entries are "local:remote" port pairs.
-func (t Target) Tunnel(forwards [][2]int) error {
-	args := t.baseArgs()
+// TunnelArgs builds the ssh argv (binary name excluded) for a port-forwarding
+// session: the usual base options, plus ExitOnForwardFailure so a forward that
+// cannot bind kills the session instead of limping on, and keepalives so a
+// dead peer is detected within about a minute. Pure — shared by foreground
+// and detached tunnel modes.
+func (t Target) TunnelArgs(forwards [][2]int) []string {
+	args := append(t.baseArgs(),
+		"-o", "ExitOnForwardFailure=yes",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
+	)
 	for _, f := range forwards {
 		args = append(args, "-L", fmt.Sprintf("%d:localhost:%d", f[0], f[1]))
 	}
-	args = append(args, "-N", t.addr())
-	c := t.command("ssh", args...)
+	return append(args, "-N", t.addr())
+}
+
+// Tunnel opens local port forwards and blocks until interrupted.
+// forwards entries are "local:remote" port pairs.
+func (t Target) Tunnel(forwards [][2]int) error {
+	c := t.command("ssh", t.TunnelArgs(forwards)...)
 	c.Stdout, c.Stderr = os.Stdout, os.Stderr
 	return c.Run()
 }
