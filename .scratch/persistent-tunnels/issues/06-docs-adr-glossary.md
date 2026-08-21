@@ -22,3 +22,15 @@ recorded as an ADR, and **Tunnel** joins the domain glossary.
 ## Notes
 
 Spec: ../spec.md. Last ticket — everything behavioral must be merged first.
+
+## Comments
+
+2026-08-21 (agent, from target-user spec review): strong evidence that agent docs alone don't
+get read — the reviewing agent worked a full session beside this repo, hit five friction points
+that shipped features already solved (`run --wait`, `down -y`, `extend --by`, `sync --exclude`,
+`logs -f`), and discovered none of them, because it read `rig --help` / `rig <cmd> --help`, not
+AGENTS.md. Implication for this ticket: the ensure/verify/stop contract must be legible from
+`rig tunnel --help` itself (Long text: `--detach` exit-0 means ports usable now, idempotent;
+verify with `tunnel status --json`; release with `tunnel stop`), with README/agent-docs/ADR as
+the secondary layer. Consider also auditing the other commands' help text for the same property
+while here — help is the contract surface agents actually read.

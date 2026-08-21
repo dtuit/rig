@@ -137,3 +137,32 @@ tears it down. `rig down` cleans up the instance's tunnels with it. The existing
   of the profile the instance was created from is unknown") — fix it while touching the command.
 - Seam choice and the supervisor model (rig re-exec + auto-reconnect, over plain detached ssh)
   were confirmed with the user before this spec was written.
+
+## Comments
+
+2026-08-21 — target-user review (agent that drove rig for a full training-matrix session),
+triaged by agent; decisions pending Darren:
+
+1. **Ground truth on demand:** that session never needed a tunnel — every workload was a batch
+   job writing to disk. The spec solves a real access gap, but the session's actual friction was
+   *discoverability*: nearly every pain point hit already had a shipped solution (`run --wait`,
+   `down -y`, `extend --by`, `sync --exclude`, `logs -f`) that went unused because the agent
+   read `--help`, not AGENTS.md/docs.
+2. **Story 17 is under-specified (accepted into 06 as a comment):** the ensure/verify/stop
+   contract must be legible from `rig tunnel --help` itself (and the subcommands' help), not
+   only from agent docs — otherwise agents will hand-roll tunnels the way `--wait` was missed.
+3. **Give-up rule vs story 3 (recorded on 05):** a 15-minute continuous-failure window kills the
+   tunnel under a 20-minute network partition during an 8-hour job — exactly the confusion story
+   3 promises to prevent. Proposal: configurable window, and/or default it longer than a typical
+   job, or give up only once the instance's deadline has passed. Needs a decision before 05.
+4. **IP pinning + name reuse hazard (recorded on 02):** best-effort stop in `rig down` plus
+   pinned IPs means `down X` (stop fails, warns) → `up --name X` can leave a live supervisor
+   forwarding to a recycled IP — story 5's "never silently talk to the wrong backend" enforced
+   for ports but not hosts. Proposal: ensure compares the recorded IP against the resolved
+   instance's current IP and replaces the tunnel on mismatch (ensure-time check only; no
+   mid-supervision re-resolution, Out of Scope stands).
+5. **Story 6 confirmed load-bearing:** exit-0-means-usable-now is the highest-value invariant in
+   the document per the reviewer; keep it pinned by the launcher-seam tests (02 already does).
+
+Separately filed: `rig sync --quiet` (rsync progress output blew a 50–95KB hole in the agent's
+context twice) → `.scratch/agent-ergonomics/issues/09-sync-quiet.md`, needs-triage.

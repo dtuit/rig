@@ -26,3 +26,14 @@ so a deleted instance never leaves a process spinning forever.
 
 Spec: ../spec.md — see "Give-up rule". This completes the agent story: connection-refused
 mid-job stops being a misdiagnosis trap.
+
+## Comments
+
+2026-08-21 (agent, from target-user spec review — pending Darren's triage): the 15-minute
+give-up window contradicts story 3 for long jobs. Real usage was 8-hour runs; a 20-minute
+network partition would permanently kill the tunnel, discovered only via a later status call.
+Options, roughly in order of preference: (a) give up only once the instance's recorded deadline
+has passed — retrying against a live instance is never pointless, and the deadline is exactly
+the "this instance no longer exists" signal; (b) make the window a flag/config with a much
+longer default (hours, not minutes); (c) keep 15m but have ensure-on-gave-up auto-heal (already
+in acceptance) plus a status hint. Decide before implementing the give-up checkbox.

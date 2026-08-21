@@ -31,3 +31,14 @@ established within the bounded startup window exits non-zero with a clear messag
 
 Spec: ../spec.md — see "Ensure semantics", "Supervisor = rig re-execing itself", "State store".
 Reconnect/backoff and give-up are ticket 05; status is 03; stop is 04.
+
+## Comments
+
+2026-08-21 (agent, from target-user spec review — pending Darren's triage): proposed extra
+ensure invariant. Because `rig down`'s tunnel stop is best-effort and supervisors pin the IP,
+`down X` (stop fails, warns) followed by `up --name X` can leave a live supervisor forwarding to
+a recycled IP — silently the wrong host. Proposal: ensure compares each live tunnel's recorded
+instance ID/IP against the resolved instance's current ID/IP and replaces the tunnel on mismatch
+instead of reporting already-up. Ensure-time check only; mid-supervision re-resolution stays out
+of scope. If accepted, add an acceptance checkbox + a launcher-seam test (stale tunnel to old
+IP, ensure after name reuse → replaced, not "already up").
