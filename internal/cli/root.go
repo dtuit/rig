@@ -36,14 +36,13 @@ func newApp() (*core.App, error) {
 	if err != nil {
 		return nil, err
 	}
-	app = &core.App{
-		Cfg:  cfg,
-		Prov: prov,
-		Log: func(format string, a ...any) {
-			fmt.Fprintf(os.Stderr, "rig: "+format+"\n", a...)
-		},
-	}
+	app = &core.App{Cfg: cfg, Prov: prov, Log: stderrLogf}
 	return app, nil
+}
+
+// stderrLogf is the CLI's shared progress logger: rig-prefixed, on stderr.
+func stderrLogf(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "rig: "+format+"\n", a...)
 }
 
 func NewRoot() *cobra.Command {
@@ -76,6 +75,7 @@ func NewRoot() *cobra.Command {
 		newExtendCmd(),
 		newSSHCmd(),
 		newTunnelCmd(),
+		newTunnelSuperviseCmd(),
 		newSyncCmd(),
 		newFetchCmd(),
 		newRunCmd(),

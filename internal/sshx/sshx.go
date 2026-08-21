@@ -154,6 +154,17 @@ func (t Target) TunnelArgs(forwards [][2]int) []string {
 	return append(args, "-N", t.addr())
 }
 
+// SupervisedTunnelCommand returns the ssh child for a supervised
+// port-forwarding session, stdio unset. Connection multiplexing is disabled
+// (prepended, since ssh takes the first value per keyword) so the child owns
+// its connection and its lifetime is the tunnel's lifetime — with the shared
+// ControlMaster, the forward would be delegated to the persistent master and
+// the child would exit immediately, unsupervivable.
+func (t Target) SupervisedTunnelCommand(forwards [][2]int) *exec.Cmd {
+	args := append([]string{"-o", "ControlMaster=no", "-o", "ControlPath=none"}, t.TunnelArgs(forwards)...)
+	return t.command("ssh", args...)
+}
+
 // Tunnel opens local port forwards and blocks until interrupted.
 // forwards entries are "local:remote" port pairs.
 func (t Target) Tunnel(forwards [][2]int) error {

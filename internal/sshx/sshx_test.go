@@ -45,6 +45,23 @@ func TestTunnelArgs(t *testing.T) {
 	}
 }
 
+// A supervised tunnel's ssh child must own its connection: multiplexing
+// options must come first (ssh takes the first value per keyword), or the
+// forward is delegated to the persistent ControlMaster and the child exits
+// immediately — unsupervivable.
+func TestSupervisedTunnelCommandDisablesMultiplexing(t *testing.T) {
+	target := Target{User: "ubuntu", Host: "10.0.0.5"}
+	args := target.SupervisedTunnelCommand([][2]int{{8000, 8000}}).Args
+	want := []string{"ssh", "-o", "ControlMaster=no", "-o", "ControlPath=none"}
+	if len(args) < len(want) || !reflect.DeepEqual(args[:len(want)], want) {
+		t.Errorf("args = %v, want prefix %v", args, want)
+	}
+	rest := args[len(want):]
+	if !reflect.DeepEqual(rest, target.TunnelArgs([][2]int{{8000, 8000}})) {
+		t.Errorf("after the multiplexing override, args should be TunnelArgs unchanged, got %v", rest)
+	}
+}
+
 // TunnelArgs must be pure: same inputs, same output, no input mutated.
 func TestTunnelArgsPure(t *testing.T) {
 	target := Target{User: "ubuntu", Host: "10.0.0.5", ForwardAgent: true, IdentityFile: "/k"}

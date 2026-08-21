@@ -64,7 +64,11 @@ tears it down. `rig down` cleans up the instance's tunnels with it. The existing
 - **Ensure semantics.** Resolve the instance (existing resolution rules, profile-port fallback
   included). If a live tunnel for this instance already covers the requested forwards → exit 0,
   say so. If a requested local port belongs to a live tunnel for a *different* instance or a
-  different remote port → error naming the conflict. Otherwise start a supervisor and block until
+  different remote port → error naming the conflict. A live tunnel recorded under this instance's
+  *name* whose instance ID or IP no longer matches the resolved instance (name reuse after an
+  incomplete `rig down`) is stopped and replaced, never trusted — exit 0 must not mean
+  "forwarding to a recycled address" (accepted 2026-08-21 from target-user review). Otherwise
+  start a supervisor and block until
   the first successful connection with forwards bound, up to a bounded startup timeout (default
   ~30s) — success is only reported once the ports are actually usable. Additional ports for an
   already-tunneled instance start an additional supervisor; ensure/stop/status treat the
@@ -74,9 +78,14 @@ tears it down. `rig down` cleans up the instance's tunnels with it. The existing
   phase (connected / reconnecting / gave-up), last error, last-change time. The supervisor owns
   its file's lifecycle: writes on phase change, removes it on clean stop. Readers treat a state
   file whose pid is not alive as stale and reap it. No credentials in state (ADR-0003 spirit).
-- **Give-up rule**: the supervisor retries with capped backoff (cap ~1 minute) and exits after a
-  sustained continuous-failure window (default 15 minutes), recording the final error in state so
-  status can explain what happened.
+- **Give-up rule**: the supervisor retries with capped backoff (cap ~1 minute) and gives up only
+  once the instance's recorded deadline has passed (from the spend ledger: the up event's TTL
+  plus extend events; advisory per ADR-0004, so an instance unknown to the ledger falls back to
+  a long default window, ~24h), recording the final error in state so status can explain what
+  happened. Chosen over the original fixed 15-minute window (accepted 2026-08-21 from
+  target-user review): an 8-hour job must survive a 20-minute partition, retrying against an
+  instance that still exists is never pointless, and the deadline is rig's own "this instance is
+  gone" signal.
 - **CLI surface**: the tunnel command grows subcommands — `rig tunnel status` and
   `rig tunnel stop [ports…]` — while ensure stays a `--detach` flag on the base command, because
   ensure is the same operation as foreground tunneling (same port resolution, same shape) with a
@@ -151,11 +160,13 @@ triaged by agent; decisions pending Darren:
 2. **Story 17 is under-specified (accepted into 06 as a comment):** the ensure/verify/stop
    contract must be legible from `rig tunnel --help` itself (and the subcommands' help), not
    only from agent docs — otherwise agents will hand-roll tunnels the way `--wait` was missed.
-3. **Give-up rule vs story 3 (recorded on 05):** a 15-minute continuous-failure window kills the
+3. **ACCEPTED 2026-08-21 (option a, deadline-based — Implementation Decisions updated):**
+   **Give-up rule vs story 3 (recorded on 05):** a 15-minute continuous-failure window kills the
    tunnel under a 20-minute network partition during an 8-hour job — exactly the confusion story
    3 promises to prevent. Proposal: configurable window, and/or default it longer than a typical
    job, or give up only once the instance's deadline has passed. Needs a decision before 05.
-4. **IP pinning + name reuse hazard (recorded on 02):** best-effort stop in `rig down` plus
+4. **ACCEPTED 2026-08-21 (folded into 02's acceptance — Implementation Decisions updated):**
+   **IP pinning + name reuse hazard (recorded on 02):** best-effort stop in `rig down` plus
    pinned IPs means `down X` (stop fails, warns) → `up --name X` can leave a live supervisor
    forwarding to a recycled IP — story 5's "never silently talk to the wrong backend" enforced
    for ports but not hosts. Proposal: ensure compares the recorded IP against the resolved
