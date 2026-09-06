@@ -41,7 +41,7 @@ func TestWaitScriptUnderSh(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := func(name string) string {
-		cmd := exec.Command("sh", "-c", waitScript(name, time.Second, time.Second))
+		cmd := exec.Command("sh", "-c", waitScript(name, "", time.Second, time.Second))
 		cmd.Env = append(os.Environ(), "HOME="+home)
 		out, err := cmd.Output()
 		if err != nil {
@@ -53,11 +53,110 @@ func TestWaitScriptUnderSh(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, ".rig", "logs", "train.exit"), []byte("7\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if state, code := parseWaitOutput(run("train")); state != "EXIT" || code != 7 {
-		t.Errorf("finished job: got %s %d, want EXIT 7", state, code)
+	if res := parseWaitOutput(run("train")); res.state != "EXIT" || res.code != 7 {
+		t.Errorf("finished job: got %s %d, want EXIT 7", res.state, res.code)
 	}
-	if state, _ := parseWaitOutput(run("ghost")); state != "NOJOB" {
-		t.Errorf("unknown job: got %s, want NOJOB", state)
+	if res := parseWaitOutput(run("ghost")); res.state != "NOJOB" {
+		t.Errorf("unknown job: got %s, want NOJOB", res.state)
+	}
+}
+
+// TestWaitScriptForPatternUnderSh covers the --for branch in a real shell: a
+// matching log line wins over the exit file; a finished job with no match
+// reports EXIT (issue 12).
+func TestWaitScriptForPatternUnderSh(t *testing.T) {
+	home := t.TempDir()
+	logs := filepath.Join(home, ".rig", "logs")
+	if err := os.MkdirAll(logs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(name, pattern string) waitResult {
+		cmd := exec.Command("sh", "-c", waitScript(name, pattern, time.Second, time.Second))
+		cmd.Env = append(os.Environ(), "HOME="+home)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("script failed: %v", err)
+		}
+		return parseWaitOutput(string(out))
+	}
+	log := "stage: fetch\nit's step 10/500 loss=0.42\nstage: train\n"
+	if err := os.WriteFile(filepath.Join(logs, "train.log"), []byte(log), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(logs, "train.exit"), []byte("0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if res := run("train", "^stage: (train|bench)$"); res.state != "MATCH" || res.line != "stage: train" {
+		t.Errorf("match: got %+v, want MATCH stage: train", res)
+	}
+	if res := run("train", "^it's step [0-9]+/500 "); res.state != "MATCH" || !strings.HasPrefix(res.line, "it's step") {
+		t.Errorf("pattern with quote/regex chars: got %+v", res)
+	}
+	if res := run("train", "never appears"); res.state != "EXIT" || res.code != 0 {
+		t.Errorf("finished without match: got %+v, want EXIT 0", res)
+	}
+}
+
+// TestWaitScriptTargetsExactSession is issue 11: has-session -t rig-x would
+// also match rig-x2 by prefix; =rig-x forces an exact match.
+func TestWaitScriptTargetsExactSession(t *testing.T) {
+	s := waitScript("pipeline", "", time.Second, time.Second)
+	if !strings.Contains(s, "has-session -t =rig-pipeline ") {
+		t.Errorf("script lacks exact-match tmux target: %s", s)
+	}
+}
+
+func TestWaitScriptQuotesPattern(t *testing.T) {
+	s := waitScript("train", "loss=[0-9.]+ it's", time.Second, time.Second)
+	if !strings.Contains(s, `grep -m1 -E -e 'loss=[0-9.]+ it'\''s' "$HOME"/.rig/logs/train.log`) {
+		t.Errorf("script lacks the quoted grep: %s", s)
+	}
+	if strings.Contains(waitScript("train", "", time.Second, time.Second), "grep") {
+		t.Error("script without a pattern should not grep")
+	}
+}
+
+func TestParseWaitOutput(t *testing.T) {
+	cases := []struct {
+		in   string
+		want waitResult
+	}{
+		{"EXIT 7\n", waitResult{state: "EXIT", code: 7}},
+		{"Welcome to Ubuntu\n\nEXIT 0\n", waitResult{state: "EXIT"}},
+		{"NOJOB\n", waitResult{state: "NOJOB"}},
+		{"TIMEOUT\r\n", waitResult{state: "TIMEOUT"}},
+		{"MATCH stage: train\n", waitResult{state: "MATCH", line: "stage: train"}},
+		{"motd noise\nMATCH step 10/500  loss=0.42 EXIT 3\n", waitResult{state: "MATCH", line: "step 10/500  loss=0.42 EXIT 3"}},
+		{"MATCH\n", waitResult{state: "MATCH"}},
+		{"garbage\n", waitResult{}},
+	}
+	for _, c := range cases {
+		if got := parseWaitOutput(c.in); got != c.want {
+			t.Errorf("parseWaitOutput(%q) = %+v, want %+v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestWaitForLineReturnsMatch(t *testing.T) {
+	r := &fakeRunner{results: []fakeResult{{out: "TIMEOUT\n"}, {out: "MATCH stage: train\n"}}}
+	line, err := WaitForLine(r, "train", "^stage: train$", WaitConfig{})
+	if err != nil || line != "stage: train" {
+		t.Fatalf("WaitForLine = %q, %v; want stage: train, nil", line, err)
+	}
+	if len(r.cmds) != 2 || !strings.Contains(r.cmds[0], "'^stage: train$'") {
+		t.Errorf("polls = %q, want 2 carrying the quoted pattern", r.cmds)
+	}
+}
+
+func TestWaitForLineJobEndedIsNoMatch(t *testing.T) {
+	r := &fakeRunner{results: []fakeResult{{out: "EXIT 3\n"}}}
+	_, err := WaitForLine(r, "train", "never", WaitConfig{})
+	if !errors.Is(err, ErrNoMatch) || !strings.Contains(err.Error(), "exited 3") {
+		t.Fatalf("err = %v, want ErrNoMatch naming the exit code", err)
+	}
+	r = &fakeRunner{results: []fakeResult{{out: "TIMEOUT\n", delay: 30 * time.Millisecond}}}
+	if _, err := WaitForLine(r, "train", "never", WaitConfig{Timeout: 10 * time.Millisecond}); !errors.Is(err, ErrWaitTimeout) {
+		t.Fatalf("err = %v, want ErrWaitTimeout", err)
 	}
 }
 

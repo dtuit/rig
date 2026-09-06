@@ -29,3 +29,19 @@ command; this issue is the general mechanism.
 
 - Command naming (`env push` vs `creds`), and whether `--env-file` on `run` is enough on its own.
 - Should `rig up` warn if `~/.rig/env` creds outlive the TTL extension story?
+
+## Comments
+
+**New evidence (2026-09-06, agent session d301490d):** an ad-hoc `rig up --type ... --name ...`
+has no way to push an env file at all; `EnvFiles` only flows from a profile
+(`core.SpecFromProfile`). The session needed a HuggingFace token on the instance and rsynced
+`huggingface.env` by hand to a bespoke path that its scripts then sourced, bypassing
+`~/.rig/env` entirely. Minimum viable slice of this issue: `rig up --env-file FILE` (repeatable)
+and `rig env push FILE` for a running instance, both landing in `~/.rig/env` via the existing
+`remote.PushEnvFile`. The STS half can follow.
+**`--env-file` slice landed (2026-09-06, agent):** the minimum transport for ad-hoc launches:
+`rig up --env-file FILE` (repeatable `StringArray`, `internal/cli/lifecycle.go`) appends to
+`spec.EnvFiles`, so the files ride the existing `remote.PushEnvFile` path exactly like a
+profile's `env_files` (stacking on them when a profile is used). Nothing else here is
+implemented — `rig env push`, `rig run --env-file`, `rig creds aws`/STS and the naming
+question stay open for triage; status left as needs-triage.

@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/dtuit/rig/internal/shellq"
 )
 
 // Runner executes a command on an instance; sshx.Target satisfies it.
@@ -16,6 +18,10 @@ type Runner interface {
 // ErrWaitTimeout is returned when WaitConfig.Timeout expires before the job
 // finishes. The CLI maps it to exit code 124.
 var ErrWaitTimeout = errors.New("timed out waiting for job")
+
+// ErrNoMatch is returned by WaitForLine when the job ends before any log line
+// matches the pattern. The CLI maps it to exit code 125 (ADR-0005).
+var ErrNoMatch = errors.New("job ended before a log line matched")
 
 type WaitConfig struct {
 	Timeout time.Duration // give up after this long; 0 waits forever
@@ -31,8 +37,42 @@ type WaitConfig struct {
 // EXIT <code>, NOJOB, or TIMEOUT on stdout; transient ssh failures are
 // retried.
 func WaitJob(r Runner, name string, cfg WaitConfig) (int, error) {
+	res, err := waitLoop(r, name, "", cfg)
+	if err != nil {
+		return 0, err
+	}
+	return res.code, nil
+}
+
+// WaitForLine blocks until a line of the job's log matches pattern (an
+// extended regex, grep -E) and returns that line (issue 12). The job ending
+// first is ErrNoMatch; the poll otherwise behaves exactly like WaitJob.
+func WaitForLine(r Runner, name, pattern string, cfg WaitConfig) (string, error) {
+	if pattern == "" {
+		return "", fmt.Errorf("empty log pattern")
+	}
+	res, err := waitLoop(r, name, pattern, cfg)
+	if err != nil {
+		return "", err
+	}
+	if res.state != "MATCH" {
+		return "", fmt.Errorf("job %q exited %d: %w", name, res.code, ErrNoMatch)
+	}
+	return res.line, nil
+}
+
+// waitResult is one parsed poll outcome: state EXIT (code), MATCH (line),
+// NOJOB, or TIMEOUT.
+type waitResult struct {
+	state string
+	code  int
+	line  string
+}
+
+// waitLoop drives the chunked remote poll until it yields EXIT or MATCH.
+func waitLoop(r Runner, name, pattern string, cfg WaitConfig) (waitResult, error) {
 	if !nameRe.MatchString(name) {
-		return 0, fmt.Errorf("invalid job name %q", name)
+		return waitResult{}, fmt.Errorf("invalid job name %q", name)
 	}
 	if cfg.Poll <= 0 {
 		cfg.Poll = 5 * time.Second
@@ -53,33 +93,33 @@ func WaitJob(r Runner, name string, cfg WaitConfig) (int, error) {
 		if !deadline.IsZero() {
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
-				return 0, ErrWaitTimeout
+				return waitResult{}, ErrWaitTimeout
 			}
 			if remaining < chunk {
 				chunk = remaining
 			}
 		}
-		out, err := r.Run(waitScript(name, cfg.Poll, chunk))
+		out, err := r.Run(waitScript(name, pattern, cfg.Poll, chunk))
 		if err != nil {
 			failures++
 			if failures >= maxWaitFailures {
-				return 0, fmt.Errorf("waiting for job %q: ssh failed %d times in a row: %v: %s",
+				return waitResult{}, fmt.Errorf("waiting for job %q: ssh failed %d times in a row: %v: %s",
 					name, failures, err, strings.TrimSpace(out))
 			}
 			cfg.sleep(waitRetryPause)
 			continue
 		}
 		failures = 0
-		state, code := parseWaitOutput(out)
-		switch state {
-		case "EXIT":
-			return code, nil
+		res := parseWaitOutput(out)
+		switch res.state {
+		case "EXIT", "MATCH":
+			return res, nil
 		case "NOJOB":
-			return 0, fmt.Errorf("no job named %q (rig ps to list)", name)
+			return waitResult{}, fmt.Errorf("no job named %q (rig ps to list)", name)
 		case "TIMEOUT":
 			continue // next iteration re-checks the deadline
 		default:
-			return 0, fmt.Errorf("unexpected wait output %q", strings.TrimSpace(out))
+			return waitResult{}, fmt.Errorf("unexpected wait output %q", strings.TrimSpace(out))
 		}
 	}
 }
@@ -90,11 +130,14 @@ const (
 )
 
 // waitScript polls for the job's exit file server-side. It always exits 0
-// and reports through stdout — EXIT <code>, NOJOB, or TIMEOUT — so ssh's own
-// exit status stays reserved for transport failure (ADR-0001). POSIX sh: the
-// remote login shell is not guaranteed to be bash.
-func waitScript(name string, poll, chunk time.Duration) string {
+// and reports through stdout — EXIT <code>, NOJOB, TIMEOUT, or (with a
+// pattern) MATCH <line> — so ssh's own exit status stays reserved for
+// transport failure (ADR-0001). The tmux target uses the exact-match form
+// =rig-<name> so a sibling like rig-<name>2 is not mistaken for the job
+// (issue 11). POSIX sh: the remote login shell is not guaranteed to be bash.
+func waitScript(name, pattern string, poll, chunk time.Duration) string {
 	exitFile := fmt.Sprintf(`"$HOME"/.rig/logs/%s.exit`, name)
+	logFile := fmt.Sprintf(`"$HOME"/.rig/logs/%s.log`, name)
 	pollSecs := int(poll / time.Second)
 	if pollSecs < 1 {
 		pollSecs = 1
@@ -103,30 +146,42 @@ func waitScript(name string, poll, chunk time.Duration) string {
 	if chunkSecs < 1 {
 		chunkSecs = 1
 	}
+	// match is re-run right before reporting EXIT/NOJOB so a line written in
+	// the job's last moments is not lost to the poll interval.
+	match := ""
+	if pattern != "" {
+		match = fmt.Sprintf(`l=$(grep -m1 -E -e %s %s 2>/dev/null) && { echo "MATCH $l"; exit 0; }; `,
+			shellq.Quote(pattern), logFile)
+	}
 	return fmt.Sprintf(
-		`end=$(( $(date +%%s) + %[1]d )); while :; do `+
-			`if [ -f %[2]s ]; then echo "EXIT $(cat %[2]s)"; exit 0; fi; `+
-			`if ! tmux has-session -t rig-%[3]s 2>/dev/null; then sleep 1; `+
+		`end=$(( $(date +%%s) + %[1]d )); while :; do %[5]s`+
+			`if [ -f %[2]s ]; then %[5]secho "EXIT $(cat %[2]s)"; exit 0; fi; `+
+			`if ! tmux has-session -t =rig-%[3]s 2>/dev/null; then sleep 1; %[5]s`+
 			`if [ -f %[2]s ]; then echo "EXIT $(cat %[2]s)"; else echo NOJOB; fi; exit 0; fi; `+
 			`if [ "$(date +%%s)" -ge "$end" ]; then echo TIMEOUT; exit 0; fi; `+
 			`sleep %[4]d; done`,
-		chunkSecs, exitFile, name, pollSecs)
+		chunkSecs, exitFile, name, pollSecs, match)
 }
 
 // parseWaitOutput finds the result token in the poll output, scanning from
-// the last line so stray remote noise (motd, warnings) is ignored.
-func parseWaitOutput(out string) (state string, code int) {
-	lines := strings.Split(strings.TrimSpace(out), "\n")
+// the last line so stray remote noise (motd, warnings) is ignored. A MATCH
+// line carries the matched log line verbatim after one space.
+func parseWaitOutput(out string) waitResult {
+	lines := strings.Split(strings.TrimRight(out, "\r\n"), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
-		f := strings.Fields(lines[i])
+		line := strings.TrimRight(lines[i], "\r")
+		if line == "MATCH" || strings.HasPrefix(line, "MATCH ") {
+			return waitResult{state: "MATCH", line: strings.TrimPrefix(strings.TrimPrefix(line, "MATCH"), " ")}
+		}
+		f := strings.Fields(line)
 		switch {
 		case len(f) == 2 && f[0] == "EXIT":
 			if n, err := strconv.Atoi(f[1]); err == nil {
-				return "EXIT", n
+				return waitResult{state: "EXIT", code: n}
 			}
 		case len(f) == 1 && (f[0] == "NOJOB" || f[0] == "TIMEOUT"):
-			return f[0], 0
+			return waitResult{state: f[0]}
 		}
 	}
-	return "", 0
+	return waitResult{}
 }

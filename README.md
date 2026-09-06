@@ -51,12 +51,14 @@ rig                      # dashboard TUI: instances, volumes, burn rate, balance
 rig up                   # interactive picker over LIVE availability + pricing
 rig up train             # headless: first available type from the profile
 rig up --type CPU.4V.16G --name smoke --ttl 1h   # fully ad-hoc
+rig up --type 1H100.80S.32V --env-file ~/secrets/hf.env   # push KEY=VALUE files ad hoc (repeatable)
 
 rig status               # table: status, IP, $/h, age, time-to-self-destruct
 rig types --available    # what can actually be deployed right now
 rig ssh [-- cmd]         # interactive shell or one-off command (agent forwarded)
 rig sync ~/code/project    # rsync a working tree to the box
 rig sync data --exclude images/          # skip subtrees (repeatable, stacks on defaults)
+rig sync ./data:/root/data ./hf.env:/root/exp/hf.env --jobs 3   # per-path dest, single files, parallel streams
 rig fetch s3://bucket/set.tar            # download ON the instance, not through your machine
 rig tunnel 8000 50051    # forward local ports (^C to stop)
 
@@ -64,6 +66,7 @@ rig run --name train -- bash train.sh   # detached tmux job, survives disconnect
 rig ps                   # running / exited jobs
 rig logs train -f        # follow the job log
 rig wait train           # block until it finishes; exit with ITS exit code (124 = --timeout)
+rig wait train --for 'stage: train'   # block until a log line matches; prints it (125 = job ended first)
 rig run --wait -- bash train.sh          # start + wait in one command
 rig stop train           # kill a job
 
@@ -77,6 +80,19 @@ rig spend --since 168h   # spend summary from the local ledger (advisory)
 `rig ssh -- <cmd>` exits with the remote command's exit code; 255 means ssh
 itself failed *or* the remote command killed its own connection (e.g. a bare
 `pkill`), so don't chain on commands that tear down their own session.
+`rig run` shell-quotes each argument, so `rig run -- bash job.sh "A D E"` hands the
+script one third argument; `rig ssh -- 'a && b'` stays a raw string on purpose.
+
+`rig wait` exit codes: the job's own code; 124 when `--timeout` expires; with
+`--for`, 0 and the matching line on stdout, or 125 if the job ends before any
+line matches (ADR-0005).
+
+`rig sync` takes directories or single files. Each argument may carry its own
+destination as `src:dest` (the part after the last colon must start with `/`
+or `~`); `--dest` covers the rest (default `~/<basename>`). `--jobs N` runs
+transfers concurrently; three or four streams saturate a typical link. Progress
+output shows only on a terminal running a single stream; `--quiet` drops it,
+`--progress` forces it on.
 
 ## How it holds together
 
@@ -109,7 +125,12 @@ itself failed *or* the remote command killed its own connection (e.g. a bare
   shared cloud account, that prefix — and instance names — are global to the
   team.) The one exception is the spend ledger (`~/.config/rig/ledger.jsonl`),
   an advisory append-only record behind `rig spend`; the provider's billing
-  stays authoritative, and TTL-torn instances appear as estimates.
+  stays authoritative, and TTL-torn instances appear as estimates. The other is
+  the instance cache (`~/.config/rig/instances.json`, ADR-0006): written on `up`
+  and `adopt`, cleared on `down`, 12h expiry, so `ssh`, `run`, `logs`, `wait`,
+  `sync` and friends resolve a named instance without a provider call.
+  `status`, `down` and `extend` always ask the provider, and any fresh listing
+  drops entries that have gone stale.
 
 ## Agent orchestration
 
@@ -123,6 +144,7 @@ rig up train                          # blocks until ssh is ready
 rig sync ~/code/project
 rig fetch s3://bucket/dataset.tar --dest /data/
 rig run --wait --name exp42 -- bash provision/train.sh   # blocks; exits with the job's code
+rig wait exp42 --for '^epoch 1/' --timeout 30m   # wake on a log line, not on completion
 rig status --json | jq -r '.[0].ttl'  # machine-readable everything
 rig down --yes                        # tear down when done
 ```

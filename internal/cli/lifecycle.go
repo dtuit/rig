@@ -28,6 +28,7 @@ func newUpCmd() *cobra.Command {
 		ttl      string
 		volume   string
 		volSize  int
+		envFiles []string
 	)
 	cmd := &cobra.Command{
 		Use:   "up [profile]",
@@ -82,12 +83,14 @@ func newUpCmd() *cobra.Command {
 			if location != "" {
 				spec.Location = location
 			}
+			// ad-hoc env files ride the same transport as a profile's (issue 08)
+			spec.EnvFiles = append(spec.EnvFiles, envFiles...)
 			in, err := a.Up(cmd.Context(), spec)
 			if err != nil {
 				return err
 			}
 			short := strings.TrimPrefix(in.Name, core.HostPrefix)
-			fmt.Printf("\n%s is up: %s (%s, $%.2f/h%s) in %s\n", in.Name, in.IP, in.Type,
+			fmt.Printf("\n%s is up: %s (%s, $%.2f/h%s) in %s\n", short, in.IP, in.Type,
 				in.PricePerHour, spotTag(in.Spot), in.Location)
 			fmt.Printf("  rig ssh -i %s\n  rig run -i %s -- <cmd>\n", short, short)
 			return nil
@@ -101,6 +104,7 @@ func newUpCmd() *cobra.Command {
 	cmd.Flags().StringVar(&ttl, "ttl", "", "self-destruct TTL, e.g. 12h")
 	cmd.Flags().StringVar(&volume, "volume", "", "persistent volume name to attach (created if missing)")
 	cmd.Flags().IntVar(&volSize, "volume-size", 100, "size GB when creating --volume")
+	cmd.Flags().StringArrayVar(&envFiles, "env-file", nil, "KEY=VALUE file to push to the instance, repeatable (stacks on the profile's env_files)")
 	return cmd
 }
 
@@ -139,30 +143,36 @@ func newDownCmd() *cobra.Command {
 				if len(args) == 1 {
 					key = args[0]
 				}
-				in, err := a.Resolve(cmd.Context(), key)
+				// fresh: a teardown must target the instance as it is now, not as cached
+				in, err := a.ResolveFresh(cmd.Context(), key)
 				if err != nil {
 					return err
 				}
 				targets = []string{in.Name}
 			}
+			shorts := make([]string, 0, len(targets))
+			for _, name := range targets {
+				shorts = append(shorts, strings.TrimPrefix(name, core.HostPrefix))
+			}
 			verb := "delete instance"
 			if delVolumes {
 				verb = "delete instance AND ATTACHED DATA VOLUMES"
 			}
-			if !yes && !confirm(fmt.Sprintf("%s %s?", verb, strings.Join(targets, ", "))) {
+			if !yes && !confirm(fmt.Sprintf("%s %s?", verb, strings.Join(shorts, ", "))) {
 				return fmt.Errorf("aborted")
 			}
-			for _, name := range targets {
-				in, err := a.Resolve(cmd.Context(), name)
+			for i, name := range targets {
+				in, err := a.ResolveFresh(cmd.Context(), name)
 				if err != nil {
 					return err
 				}
 				stopTunnelsBestEffort(in.Name)
 				ev, err := a.Down(cmd.Context(), in, delVolumes)
 				if err != nil {
-					return fmt.Errorf("deleting %s: %w", name, err)
+					return fmt.Errorf("deleting %s: %w", shorts[i], err)
 				}
-				fmt.Printf("%s deleted (lived %.1fh, ~$%.2f)\n", name,
+				// exact figure (lifetime x price), so no ~: that marks estimates in rig spend
+				fmt.Printf("%s deleted (lived %.1fh, $%.2f)\n", shorts[i],
 					float64(ev.LifetimeSecs)/3600, ev.Cost)
 			}
 			return nil
@@ -224,7 +234,7 @@ func newExtendCmd() *cobra.Command {
 			if key == "" {
 				key = instanceFlag
 			}
-			in, err := a.Resolve(cmd.Context(), key)
+			in, err := a.ResolveFresh(cmd.Context(), key) // the ledger event wants live fields
 			if err != nil {
 				return err
 			}
@@ -240,7 +250,7 @@ func newExtendCmd() *cobra.Command {
 			if err := ledger.Append(ledger.Path(), ledger.ExtendEvent(in, deadline, time.Now())); err != nil {
 				fmt.Fprintf(os.Stderr, "rig: warning: spend ledger: %v\n", err)
 			}
-			fmt.Printf("%s self-destructs %s (in %s)\n", in.Name,
+			fmt.Printf("%s self-destructs %s (in %s)\n", strings.TrimPrefix(in.Name, core.HostPrefix),
 				deadline.Format("Mon 15:04"), time.Until(deadline).Round(time.Minute))
 			return nil
 		},

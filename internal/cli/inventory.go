@@ -59,26 +59,47 @@ func newTypesCmd() *cobra.Command {
 				slices.Sort(locs)
 				rows = append(rows, typeRow{InstanceType: t, Available: locs})
 			}
+			// issue 16: deployable types first so a truncated read still shows
+			// them; provider order is kept within each group.
+			slices.SortStableFunc(rows, func(a, b typeRow) int {
+				return boolRank(len(a.Available) > 0) - boolRank(len(b.Available) > 0)
+			})
 			if jsonFlag {
 				return renderJSON(rows)
 			}
 			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "TYPE\tGPU\tMEM\t$/H\tSPOT$/H\tAVAILABLE")
+			unavailable := 0
 			for _, r := range rows {
 				availStr := strings.Join(r.Available, ",")
 				if availStr == "" {
 					availStr = "-"
+					unavailable++
 				}
 				fmt.Fprintf(w, "%s\t%s\t%dGB\t%.2f\t%.2f\t%s\n",
 					r.Type, r.GPU, r.MemoryGB, r.PricePerHour, r.SpotPrice, availStr)
 			}
-			return w.Flush()
+			if err := w.Flush(); err != nil {
+				return err
+			}
+			if unavailable > 0 && !availOnly {
+				fmt.Printf("%d types unavailable now; rig types --available hides them\n", unavailable)
+			}
+			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&availOnly, "available", false, "only types deployable right now")
 	cmd.Flags().BoolVar(&spot, "spot", false, "check spot availability instead of on-demand")
 	cmd.Flags().StringVar(&filter, "filter", "", "substring filter on type/GPU")
 	return cmd
+}
+
+// boolRank orders true before false in a sort comparator.
+func boolRank(b bool) int {
+	if b {
+		return 0
+	}
+	return 1
 }
 
 func newImagesCmd() *cobra.Command {

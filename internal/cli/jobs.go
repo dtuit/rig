@@ -9,7 +9,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/dtuit/rig/internal/core"
 	"github.com/dtuit/rig/internal/remote"
+	"github.com/dtuit/rig/internal/shellq"
 )
 
 func newRunCmd() *cobra.Command {
@@ -18,19 +20,25 @@ func newRunCmd() *cobra.Command {
 		workdir string
 		wait    bool
 		timeout time.Duration
+		pattern string
 	)
 	cmd := &cobra.Command{
 		Use:   "run -- <command ...>",
 		Short: "Run a command detached on the instance (survives disconnect)",
 		Long: `Runs the command in a named tmux session on the instance, logging to
-~/.rig/logs/<name>.log and recording the exit code. Watch it with
+~/.rig/logs/<name>.log and recording the exit code. Each argument is
+shell-quoted, so the job sees exactly the argv you typed. Watch it with
 rig logs <name> -f, list with rig ps, kill with rig stop <name>.
 With --wait, blocks until the job finishes and exits with its exit code
-(equivalent to rig run followed by rig wait).`,
+(equivalent to rig run followed by rig wait); --for and --timeout are
+passed through to the wait.`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if timeout != 0 && !wait {
 				return fmt.Errorf("--timeout requires --wait")
+			}
+			if pattern != "" && !wait {
+				return fmt.Errorf("--for requires --wait")
 			}
 			a, err := newApp()
 			if err != nil {
@@ -40,7 +48,8 @@ With --wait, blocks until the job finishes and exits with its exit code
 			if err != nil {
 				return err
 			}
-			command := strings.Join(args, " ")
+			// issue 10: quote each argument so "A D E" stays one word on the instance.
+			command := shellq.Join(args)
 			if name == "" {
 				name = jobNameFrom(args)
 			}
@@ -48,9 +57,11 @@ With --wait, blocks until the job finishes and exits with its exit code
 			if err := remote.StartJob(t, name, workdir, command); err != nil {
 				return err
 			}
-			fmt.Printf("job %q started on %s\n  rig logs %s -f\n", name, in.Name, name)
+			// issues 15, 17: short instance name as rig status shows it; wait hint first.
+			fmt.Printf("job %q started on %s\n  rig wait %[1]s\n  rig logs %[1]s -f\n",
+				name, strings.TrimPrefix(in.Name, core.HostPrefix))
 			if wait {
-				return waitJob(t, name, timeout)
+				return waitJob(t, name, timeout, pattern)
 			}
 			return nil
 		},
@@ -59,6 +70,7 @@ With --wait, blocks until the job finishes and exits with its exit code
 	cmd.Flags().StringVar(&workdir, "workdir", "", "remote working directory")
 	cmd.Flags().BoolVar(&wait, "wait", false, "block until the job finishes; exit with its exit code")
 	cmd.Flags().DurationVar(&timeout, "timeout", 0, "with --wait: give up after this long and exit 124")
+	cmd.Flags().StringVar(&pattern, "for", "", "with --wait: return once a log line matches this extended regex (see rig wait --for)")
 	return cmd
 }
 

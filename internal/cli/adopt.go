@@ -3,10 +3,12 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dtuit/rig/internal/core"
 	"github.com/dtuit/rig/internal/ledger"
 	"github.com/dtuit/rig/internal/remote"
 )
@@ -29,7 +31,8 @@ func newAdoptCmd() *cobra.Command {
 			if len(args) == 1 {
 				key = args[0]
 			}
-			in, err := a.Resolve(cmd.Context(), key)
+			// fresh: adopt seeds the instance cache, so it must not read from it
+			in, err := a.ResolveFresh(cmd.Context(), key)
 			if err != nil {
 				return err
 			}
@@ -55,7 +58,8 @@ func newAdoptCmd() *cobra.Command {
 			if err := ledger.Append(ledger.Path(), ledger.UpEvent(in, d, start)); err != nil {
 				fmt.Fprintf(os.Stderr, "rig: warning: spend ledger: %v\n", err)
 			}
-			fmt.Printf("%s adopted: TTL %s\n", in.Name, d)
+			a.Remember(in)
+			fmt.Printf("%s adopted: TTL %s\n", strings.TrimPrefix(in.Name, core.HostPrefix), d)
 			for _, volID := range in.VolumeIDs {
 				if volID == in.OSVolumeID {
 					continue

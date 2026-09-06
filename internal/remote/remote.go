@@ -207,7 +207,9 @@ func StopJob(t sshx.Target, name string) error {
 	if !nameRe.MatchString(name) {
 		return fmt.Errorf("invalid job name %q", name)
 	}
-	out, err := t.Run(fmt.Sprintf("tmux kill-session -t rig-%s", name))
+	// =rig-<name> is tmux's exact-match target; without it rig-<name> would
+	// also match a prefix sibling like rig-<name>2 (issue 11).
+	out, err := t.Run(fmt.Sprintf("tmux kill-session -t =rig-%s", name))
 	if err != nil {
 		return fmt.Errorf("stopping job %s: %v: %s", name, err, out)
 	}

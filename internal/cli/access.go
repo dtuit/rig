@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -332,18 +333,103 @@ func syncExcludes(includeGit bool, extra []string) []string {
 	return append(excludes, extra...)
 }
 
+// syncPair is one local source and where it lands on the instance, in the
+// exact form rsync receives them: a directory carries a trailing slash on
+// both sides (copy contents into dest), a file carries none (dest is the
+// file's remote path).
+type syncPair struct {
+	Src, Dest string
+}
+
+// splitSyncArg splits a "src:dest" argument on its last colon, but only when
+// what follows looks like a remote path (starts with / or ~) — so a bare
+// path, a Windows drive letter, or an odd filename with a colon stays a
+// plain source. dest is "" when the argument carries none.
+func splitSyncArg(arg string) (src, dest string) {
+	i := strings.LastIndex(arg, ":")
+	if i < 0 {
+		return arg, ""
+	}
+	if rest := arg[i+1:]; strings.HasPrefix(rest, "/") || strings.HasPrefix(rest, "~") {
+		return arg[:i], rest
+	}
+	return arg, ""
+}
+
+// planSync turns one argument into its rsync pair. defaultDest is --dest
+// (empty means ~/<basename>) and applies to arguments without their own;
+// isDir reports whether the local source is a directory (issue 14: a file
+// source must not grow a trailing slash, or rsync fails on "file/").
+func planSync(arg, defaultDest string, isDir bool) syncPair {
+	src, dest := splitSyncArg(arg)
+	src = strings.TrimSuffix(config.ExpandHome(src), "/")
+	if dest == "" {
+		dest = defaultDest
+	}
+	if dest == "" {
+		dest = "~/" + filepath.Base(src)
+	}
+	if isDir {
+		return syncPair{Src: src + "/", Dest: strings.TrimSuffix(dest, "/") + "/"}
+	}
+	return syncPair{Src: src, Dest: dest}
+}
+
+// showProgress decides whether rsync streams progress (issue 09): --quiet
+// always wins, --progress forces it on, and otherwise only a terminal
+// watching a single stream gets it — piped output (an agent reading it) and
+// parallel streams (interleaved bars) do not.
+func showProgress(quiet, force, tty bool, jobs int) bool {
+	switch {
+	case quiet:
+		return false
+	case force:
+		return true
+	default:
+		return tty && jobs <= 1
+	}
+}
+
+// stdoutIsTTY reports whether stdout is a terminal.
+func stdoutIsTTY() bool {
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
 func newSyncCmd() *cobra.Command {
 	var (
 		dest       string
 		del        bool
 		includeGit bool
 		excludes   []string
+		jobs       int
+		quiet      bool
+		progress   bool
 	)
 	cmd := &cobra.Command{
-		Use:   "sync <local-path> [more-paths...]",
-		Short: "rsync local directories to the instance",
-		Args:  cobra.MinimumNArgs(1),
+		Use:   "sync <local-path>[:remote-path] [more...]",
+		Short: "rsync local directories or files to the instance",
+		Long: `rsyncs each local path to the instance. A directory's contents land in
+the destination (default ~/<basename>); a file lands at the destination
+path itself. Each argument may carry its own destination as src:dest
+(the part after the last colon must start with / or ~); --dest covers
+the rest. --jobs runs that many transfers at once — three or four
+streams saturate a typical link. Progress output is shown only on a
+terminal running a single stream; --quiet drops it, --progress forces it.`,
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if jobs < 1 {
+				return fmt.Errorf("--jobs must be at least 1")
+			}
+			var plans []syncPair
+			for _, arg := range args {
+				src, _ := splitSyncArg(arg)
+				fi, err := os.Stat(config.ExpandHome(src))
+				if err != nil {
+					return fmt.Errorf("sync %s: %w", src, err)
+				}
+				plans = append(plans, planSync(arg, dest, fi.IsDir()))
+			}
 			a, err := newApp()
 			if err != nil {
 				return err
@@ -353,23 +439,45 @@ func newSyncCmd() *cobra.Command {
 				return err
 			}
 			t := a.Target(in)
-			for _, src := range args {
-				src = strings.TrimSuffix(config.ExpandHome(src), "/")
-				d := dest
-				if d == "" {
-					d = "~/" + filepath.Base(src)
-				}
-				fmt.Printf("sync %s -> %s:%s\n", src, in.Name, d)
-				if err := t.Rsync(src+"/", d+"/", syncExcludes(includeGit, excludes), del); err != nil {
-					return err
-				}
+			short := strings.TrimPrefix(in.Name, core.HostPrefix)
+			excl := syncExcludes(includeGit, excludes)
+			withProgress := showProgress(quiet, progress, stdoutIsTTY(), jobs)
+			if jobs > 1 {
+				// separate TCP connections, or the streams share one multiplexed window
+				t.NoMultiplex = true
 			}
-			return nil
+
+			// bounded fan-out; every failure is collected and reported, not just the first
+			var (
+				wg   sync.WaitGroup
+				sem  = make(chan struct{}, jobs)
+				mu   sync.Mutex
+				errs []error
+			)
+			for _, p := range plans {
+				sem <- struct{}{}
+				wg.Add(1)
+				go func(p syncPair) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					fmt.Printf("sync %s -> %s:%s\n", strings.TrimSuffix(p.Src, "/"), short, strings.TrimSuffix(p.Dest, "/"))
+					if err := t.Rsync(p.Src, p.Dest, excl, del, withProgress); err != nil {
+						mu.Lock()
+						errs = append(errs, fmt.Errorf("sync %s: %w", strings.TrimSuffix(p.Src, "/"), err))
+						mu.Unlock()
+					}
+				}(p)
+			}
+			wg.Wait()
+			return errors.Join(errs...)
 		},
 	}
-	cmd.Flags().StringVar(&dest, "dest", "", "remote destination (default ~/<basename>)")
+	cmd.Flags().StringVar(&dest, "dest", "", "remote destination for paths without their own src:dest (default ~/<basename>)")
 	cmd.Flags().BoolVar(&del, "delete", false, "delete remote files not present locally")
 	cmd.Flags().BoolVar(&includeGit, "include-git", false, "also sync .git directories")
 	cmd.Flags().StringArrayVar(&excludes, "exclude", nil, "rsync exclude pattern, repeatable (stacks on the defaults)")
+	cmd.Flags().IntVar(&jobs, "jobs", 1, "transfers to run concurrently")
+	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "no progress output (automatic when stdout is not a terminal)")
+	cmd.Flags().BoolVar(&progress, "progress", false, "force progress output even when piped or parallel")
 	return cmd
 }

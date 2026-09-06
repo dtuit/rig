@@ -39,16 +39,23 @@ marked with ~.`,
 			}
 			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "NAME\tTYPE\tSTARTED\tHOURS\tCOST")
+			estimated := false
 			for _, l := range lines {
 				marker := ""
 				if l.Estimated {
 					marker = "~"
+					estimated = true
 				}
 				fmt.Fprintf(w, "%s\t%s\t%s\t%.1f\t%s$%.2f\n",
 					l.Name, l.Type, l.StartedAt.Local().Format("Jan 02 15:04"), l.Hours, marker, l.Cost)
 			}
 			w.Flush()
-			fmt.Printf("\ntotal: $%.2f (~ = estimated: no down event, likely TTL teardown)\n", total)
+			// issue 17: explain the ~ marker only when a row carries it.
+			legend := ""
+			if estimated {
+				legend = " (~ = estimated: no down event, likely TTL teardown)"
+			}
+			fmt.Printf("\ntotal: $%.2f%s\n", total, legend)
 			return nil
 		},
 	}

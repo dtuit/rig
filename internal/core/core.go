@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dtuit/rig/internal/config"
+	"github.com/dtuit/rig/internal/instcache"
 	"github.com/dtuit/rig/internal/ledger"
 	"github.com/dtuit/rig/internal/provider"
 	"github.com/dtuit/rig/internal/remote"
@@ -47,12 +48,54 @@ func (a *App) Managed(ctx context.Context) ([]provider.Instance, error) {
 	slices.SortFunc(out, func(x, y provider.Instance) int {
 		return y.CreatedAt.Compare(x.CreatedAt)
 	})
+	// a fresh listing is the one moment stale cache entries can be caught
+	if err := instcache.Reconcile(instcache.Path(), out, time.Now()); err != nil {
+		a.logf("warning: instance cache: %v", err)
+	}
 	return out, nil
 }
 
 // Resolve picks an instance by name/ID prefix; with empty key it returns the
-// sole running rig instance, erroring if that is ambiguous.
+// sole running rig instance, erroring if that is ambiguous. A named key is
+// answered from the local instance cache when it can be (ADR-0006), so the
+// ssh-heavy commands skip the provider round-trip; the cached copy carries
+// the status and IP recorded at up/adopt time, not the live ones. Commands
+// that need the live view use ResolveFresh.
 func (a *App) Resolve(ctx context.Context, key string) (*provider.Instance, error) {
+	if key != "" {
+		if in := a.cached(key); in != nil {
+			return in, nil
+		}
+	}
+	return a.ResolveFresh(ctx, key)
+}
+
+// cached answers key from the instance cache, or nil on a miss. Cache
+// trouble is a warning, never an error: the provider path still works.
+func (a *App) cached(key string) *provider.Instance {
+	instances, err := instcache.Read(instcache.Path(), time.Now())
+	if err != nil {
+		a.logf("warning: instance cache: %v", err)
+		return nil
+	}
+	return match(instances, key)
+}
+
+// match honours -i's contract: full hostname, short name, or ID prefix.
+func match(instances []provider.Instance, key string) *provider.Instance {
+	for i := range instances {
+		in := &instances[i]
+		if in.Name == key || in.Name == HostPrefix+key || strings.HasPrefix(in.ID, key) {
+			return in
+		}
+	}
+	return nil
+}
+
+// ResolveFresh is Resolve against the provider only — for status-bearing
+// commands (down, extend) whose answer must reflect the instance as it is
+// now, not as it was cached.
+func (a *App) ResolveFresh(ctx context.Context, key string) (*provider.Instance, error) {
 	instances, err := a.Managed(ctx)
 	if err != nil {
 		return nil, err
@@ -77,10 +120,8 @@ func (a *App) Resolve(ctx context.Context, key string) (*provider.Instance, erro
 			return nil, fmt.Errorf("multiple running instances (%s); pick one with -i", strings.Join(names, ", "))
 		}
 	}
-	for _, in := range instances {
-		if in.Name == key || in.Name == HostPrefix+key || strings.HasPrefix(in.ID, key) {
-			return &in, nil
-		}
+	if in := match(instances, key); in != nil {
+		return in, nil
 	}
 	return nil, fmt.Errorf("no rig instance matching %q", key)
 }
@@ -236,6 +277,11 @@ func orDefault(s, d string) string {
 
 // Up runs the whole launch flow and returns the running, initialized instance.
 func (a *App) Up(ctx context.Context, spec UpSpec) (*provider.Instance, error) {
+	// --name rig-x would otherwise become rig-rig-x (issue 15)
+	if strings.HasPrefix(spec.Name, HostPrefix) {
+		spec.Name = strings.TrimPrefix(spec.Name, HostPrefix)
+		a.logf("--name already carries the %s prefix; using %s", HostPrefix, spec.Name)
+	}
 	hostname := HostPrefix + spec.Name
 	existing, err := a.Managed(ctx)
 	if err != nil {
@@ -345,7 +391,31 @@ func (a *App) Up(ctx context.Context, spec UpSpec) (*provider.Instance, error) {
 	if err := ledger.Append(ledger.Path(), ledger.UpEvent(in, spec.TTL, time.Now())); err != nil {
 		a.logf("warning: spend ledger: %v", err)
 	}
+	a.Remember(in)
 	return in, nil
+}
+
+// Remember records in for the cached Resolve path (issue 13); up and adopt
+// call it once the footprint is installed. Best-effort, like the ledger.
+func (a *App) Remember(in *provider.Instance) {
+	if err := instcache.Put(instcache.Path(), *in, time.Now()); err != nil {
+		a.logf("warning: instance cache: %v", err)
+	}
+}
+
+// Forget drops in from the instance cache once the provider no longer has it.
+func (a *App) Forget(in *provider.Instance) {
+	if err := instcache.Remove(instcache.Path(), in.Name); err != nil {
+		a.logf("warning: instance cache: %v", err)
+	}
+}
+
+// isNotFound spots a provider "already gone" answer. Provider errors reach
+// core as opaque text (the SDK renders "API error 404: ..."), so this is a
+// heuristic on that text, kept narrow to avoid matching an ID.
+func isNotFound(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "not found") || strings.Contains(s, "error 404")
 }
 
 func (a *App) waitRunning(ctx context.Context, id string, timeout time.Duration) (*provider.Instance, error) {
@@ -414,8 +484,12 @@ func (a *App) Down(ctx context.Context, in *provider.Instance, deleteVolumes boo
 		}
 	}
 	if err := a.Prov.DeleteInstance(ctx, in.ID, volIDs); err != nil {
+		if isNotFound(err) {
+			a.Forget(in) // the provider lost it first; the cache must not keep resolving to it
+		}
 		return ledger.Event{}, err
 	}
+	a.Forget(in)
 	ev := ledger.DownEvent(in, time.Now())
 	if err := ledger.Append(ledger.Path(), ev); err != nil {
 		a.logf("warning: spend ledger: %v", err)

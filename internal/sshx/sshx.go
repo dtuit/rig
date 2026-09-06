@@ -20,6 +20,10 @@ type Target struct {
 	ForwardAgent bool
 	IdentityFile string // explicit private key; keeps rig working when no agent is alive
 	AgentSocket  string // SSH_AUTH_SOCK override (rig-managed agent)
+	// NoMultiplex gives each ssh its own TCP connection instead of sharing the
+	// ControlMaster. Parallel transfers need it: multiplexed channels share one
+	// TCP window, so four rsyncs over one master move data no faster than one.
+	NoMultiplex bool
 }
 
 func (t Target) env() []string {
@@ -44,9 +48,15 @@ func (t Target) baseArgs() []string {
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "LogLevel=ERROR",
 		"-o", "ConnectTimeout=10",
-		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=~/.ssh/rig-%C",
-		"-o", "ControlPersist=600",
+	}
+	if t.NoMultiplex {
+		args = append(args, "-o", "ControlMaster=no", "-o", "ControlPath=none")
+	} else {
+		args = append(args,
+			"-o", "ControlMaster=auto",
+			"-o", "ControlPath=~/.ssh/rig-%C",
+			"-o", "ControlPersist=600",
+		)
 	}
 	if t.ForwardAgent {
 		args = append(args, "-A")
@@ -173,18 +183,30 @@ func (t Target) Tunnel(forwards [][2]int) error {
 	return c.Run()
 }
 
-// Rsync copies src to dest on the target (dest is a remote path).
-func (t Target) Rsync(src, dest string, excludes []string, delete bool) error {
+// rsyncArgs builds the rsync argv (binary name excluded). progress adds
+// --info=progress2, which is for a human watching a terminal — piped to an
+// agent it is tens of kilobytes of noise per sync (issue 09). Pure.
+func (t Target) rsyncArgs(src, dest string, excludes []string, delete, progress bool) []string {
 	sshCmd := "ssh " + strings.Join(t.baseArgs(), " ")
-	args := []string{"-az", "--info=progress2", "-e", sshCmd}
+	args := []string{"-az"}
+	if progress {
+		args = append(args, "--info=progress2")
+	}
+	args = append(args, "-e", sshCmd)
 	for _, e := range excludes {
 		args = append(args, "--exclude", e)
 	}
 	if delete {
 		args = append(args, "--delete")
 	}
-	args = append(args, src, t.addr()+":"+dest)
-	c := t.command("rsync", args...)
+	return append(args, src, t.addr()+":"+dest)
+}
+
+// Rsync copies src to dest on the target (dest is a remote path). Paths are
+// passed through as given, so rsync's own slash rules apply: a src with a
+// trailing slash copies its contents into dest, a file copies to dest itself.
+func (t Target) Rsync(src, dest string, excludes []string, delete, progress bool) error {
+	c := t.command("rsync", t.rsyncArgs(src, dest, excludes, delete, progress)...)
 	c.Stdout, c.Stderr = os.Stdout, os.Stderr
 	return c.Run()
 }
