@@ -56,7 +56,7 @@ func WaitForLine(r Runner, name, pattern string, cfg WaitConfig) (string, error)
 		return "", err
 	}
 	if res.state != "MATCH" {
-		return "", fmt.Errorf("job %q exited %d: %w", name, res.code, ErrNoMatch)
+		return "", fmt.Errorf("%w (job %q exited %d)", ErrNoMatch, name, res.code)
 	}
 	return res.line, nil
 }
@@ -148,9 +148,12 @@ func waitScript(name, pattern string, poll, chunk time.Duration) string {
 	}
 	// match is re-run right before reporting EXIT/NOJOB so a line written in
 	// the job's last moments is not lost to the poll interval.
+	// printf, not echo: dash's echo interprets backslash escapes, so a log line
+	// holding \t or a Windows path would come back altered or split. -a keeps
+	// grep from answering "Binary file matches" on a log with progress bytes.
 	match := ""
 	if pattern != "" {
-		match = fmt.Sprintf(`l=$(grep -m1 -E -e %s %s 2>/dev/null) && { echo "MATCH $l"; exit 0; }; `,
+		match = fmt.Sprintf(`l=$(grep -a -m1 -E -e %s %s 2>/dev/null) && { printf 'MATCH %%s\n' "$l"; exit 0; }; `,
 			shellq.Quote(pattern), logFile)
 	}
 	return fmt.Sprintf(

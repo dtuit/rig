@@ -79,7 +79,7 @@ func waitForOutcome(line string, err error, name string) error {
 	case errors.Is(err, remote.ErrWaitTimeout):
 		return exitError{124, fmt.Sprintf("timed out waiting for job %q", name)}
 	case errors.Is(err, remote.ErrNoMatch):
-		return exitError{125, fmt.Sprintf("job %q ended before its log matched (%v)", name, err)}
+		return exitError{125, err.Error()}
 	case err != nil:
 		return err
 	}

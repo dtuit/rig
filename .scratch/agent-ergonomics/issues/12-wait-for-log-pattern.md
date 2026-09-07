@@ -47,3 +47,11 @@ matching/non-matching patterns and quote/regex characters, quoted-grep presence,
 `parseWaitOutput` table, `WaitForLine` match/no-match/timeout, CLI outcome codes. Not done:
 the optional `--since-line`; README lines are recommended to the human rather than edited
 (README is being edited elsewhere).
+
+**Review fix (2026-09-07, agent, /code-review vs ec9471b):** both axes found that the remote
+script printed the matched line with `echo`, which under dash interprets backslash escapes, so a
+line holding `\t` or a Windows path came back altered or split past the `MATCH` token. Now
+`printf 'MATCH %s\n' "$l"`, and `grep -a` so a log with progress-bar bytes matches instead of
+answering "Binary file matches". The CLI no longer double-wraps the `ErrNoMatch` message. Tests
+cover a backslash line and a NUL byte in the log. Still open by design: `--since-line`; `--for` on
+a job that never existed exits 1 (NOJOB), not 125.

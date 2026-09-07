@@ -37,3 +37,6 @@ here.
 `internal/cli/jobs.go` prints the hints after `rig run` as `rig wait <job>` then
 `rig logs <job> -f`. Item 1 (the `rig down` tilde in `internal/cli/lifecycle.go`) is left
 for the lifecycle change set; status stays open until then.
+
+**Review fix (2026-09-07, agent):** the `rig run` hints now carry `-i <instance>` like the
+`rig up` hints, so they work verbatim with more than one instance running.

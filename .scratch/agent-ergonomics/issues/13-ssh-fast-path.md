@@ -46,3 +46,12 @@ ssh/run/logs/ps/stop/wait/sync/fetch/tunnel are on the cached path unchanged. Th
 advisory: a stale hit costs one ssh failure (10s ConnectTimeout), `rig status` heals it.
 Unit tests: `internal/instcache/instcache_test.go` (write/read/replace/expiry/remove/reconcile/
 corrupt file, temp dir). Not done: ssh config stanzas, `rig ip`.
+
+**Review fix (2026-09-07, agent, /code-review vs ec9471b):** `instcache.save` wrote a fixed
+`instances.json.tmp`, so two rig processes saving at once (the parallel-agent case the cache is
+for) could truncate each other's temp file; it now uses `os.CreateTemp` in the same directory
+and cleans up on failure, with a concurrent-save test. Wording moved off the CONTEXT.md Avoid
+word "expire" ("trusted for 12h"). README now says `adopt` also bypasses the cache; ADR-0006
+says which commands go through `ResolveFresh` and which through `Managed`. Left open from the
+spec: no automatic fallback to the provider on an ssh connection failure (ADR-0006 states the
+trade-off), and no `rig ip`.

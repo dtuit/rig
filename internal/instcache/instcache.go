@@ -2,7 +2,7 @@
 // ssh-heavy commands can resolve a named instance without a provider call
 // (issue 13). Advisory only (ADR-0006): entries are written on up and adopt,
 // removed on down, refreshed or dropped whenever a fresh provider listing
-// comes through, and expire on their own after MaxAge.
+// comes through, and stop being trusted once older than MaxAge.
 package instcache
 
 import (
@@ -62,14 +62,34 @@ func save(path string, entries []Entry) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	// a unique temp file per writer: two rig processes saving at once (the
+	// parallel-agent case this cache exists for) must not truncate each other
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0o644); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
-// Read returns the unexpired cached instances; a missing cache is empty.
+// Read returns the cached instances still within MaxAge; a missing cache is empty.
 func Read(path string, now time.Time) ([]provider.Instance, error) {
 	entries, err := load(path)
 	if err != nil {
@@ -85,7 +105,7 @@ func Read(path string, now time.Time) ([]provider.Instance, error) {
 }
 
 // Put records in, replacing any entry with the same ID or name and dropping
-// entries that have expired.
+// entries older than MaxAge.
 func Put(path string, in provider.Instance, now time.Time) error {
 	entries, err := load(path)
 	if err != nil {

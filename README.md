@@ -80,8 +80,8 @@ rig spend --since 168h   # spend summary from the local ledger (advisory)
 `rig ssh -- <cmd>` exits with the remote command's exit code; 255 means ssh
 itself failed *or* the remote command killed its own connection (e.g. a bare
 `pkill`), so don't chain on commands that tear down their own session.
-`rig run` shell-quotes each argument, so `rig run -- bash job.sh "A D E"` hands the
-script one third argument; `rig ssh -- 'a && b'` stays a raw string on purpose.
+`rig run` shell-quotes each argument, so `rig run -- bash job.sh 700 32 "A D E"` hands
+the script `A D E` as one third argument; `rig ssh -- 'a && b'` stays a raw string on purpose.
 
 `rig wait` exit codes: the job's own code; 124 when `--timeout` expires; with
 `--for`, 0 and the matching line on stdout, or 125 if the job ends before any
@@ -127,10 +127,10 @@ output shows only on a terminal running a single stream; `--quiet` drops it,
   an advisory append-only record behind `rig spend`; the provider's billing
   stays authoritative, and TTL-torn instances appear as estimates. The other is
   the instance cache (`~/.config/rig/instances.json`, ADR-0006): written on `up`
-  and `adopt`, cleared on `down`, 12h expiry, so `ssh`, `run`, `logs`, `wait`,
-  `sync` and friends resolve a named instance without a provider call.
-  `status`, `down` and `extend` always ask the provider, and any fresh listing
-  drops entries that have gone stale.
+  and `adopt`, cleared on `down`, entries trusted for 12h, so `ssh`, `run`,
+  `logs`, `wait`, `sync` and friends resolve a named instance without a provider
+  call. `status`, `down`, `extend` and `adopt` always ask the provider, and any
+  fresh listing drops entries that have gone stale.
 
 ## Agent orchestration
 

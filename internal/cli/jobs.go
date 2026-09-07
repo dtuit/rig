@@ -58,8 +58,8 @@ passed through to the wait.`,
 				return err
 			}
 			// issues 15, 17: short instance name as rig status shows it; wait hint first.
-			fmt.Printf("job %q started on %s\n  rig wait %[1]s\n  rig logs %[1]s -f\n",
-				name, strings.TrimPrefix(in.Name, core.HostPrefix))
+			short := strings.TrimPrefix(in.Name, core.HostPrefix)
+			fmt.Printf("job %q started on %s\n  rig wait -i %[2]s %[1]s\n  rig logs -i %[2]s %[1]s -f\n", name, short)
 			if wait {
 				return waitJob(t, name, timeout, pattern)
 			}

@@ -95,6 +95,18 @@ func TestWaitScriptForPatternUnderSh(t *testing.T) {
 	if res := run("train", "never appears"); res.state != "EXIT" || res.code != 0 {
 		t.Errorf("finished without match: got %+v, want EXIT 0", res)
 	}
+	// a line with backslashes and a NUL byte elsewhere in the log: dash's echo
+	// would rewrite \t and grep without -a would say "Binary file matches"
+	odd := "path C:\\new\\tmp done\nbinary \x00 bytes here\n"
+	if err := os.WriteFile(filepath.Join(logs, "train.log"), []byte(odd), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if res := run("train", "^path "); res.state != "MATCH" || res.line != "path C:\\new\\tmp done" {
+		t.Errorf("backslashes in the matched line: got %+v", res)
+	}
+	if res := run("train", "bytes here"); res.state != "MATCH" || !strings.HasSuffix(res.line, "bytes here") {
+		t.Errorf("binary log: got %+v, want a MATCH not 'Binary file'", res)
+	}
 }
 
 // TestWaitScriptTargetsExactSession is issue 11: has-session -t rig-x would
@@ -108,7 +120,7 @@ func TestWaitScriptTargetsExactSession(t *testing.T) {
 
 func TestWaitScriptQuotesPattern(t *testing.T) {
 	s := waitScript("train", "loss=[0-9.]+ it's", time.Second, time.Second)
-	if !strings.Contains(s, `grep -m1 -E -e 'loss=[0-9.]+ it'\''s' "$HOME"/.rig/logs/train.log`) {
+	if !strings.Contains(s, `grep -a -m1 -E -e 'loss=[0-9.]+ it'\''s' "$HOME"/.rig/logs/train.log`) || !strings.Contains(s, `printf 'MATCH %s\n' "$l"`) {
 		t.Errorf("script lacks the quoted grep: %s", s)
 	}
 	if strings.Contains(waitScript("train", "", time.Second, time.Second), "grep") {

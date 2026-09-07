@@ -1,8 +1,10 @@
 package instcache
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,5 +155,31 @@ func TestCorruptCacheIsEmpty(t *testing.T) {
 	}
 	if got, _ := Read(path, t0); len(got) != 1 {
 		t.Errorf("after recovery Read = %v", names(got))
+	}
+}
+
+// TestConcurrentSaves is the parallel-agent case: two processes saving at once
+// must not truncate each other's temp file, and the file must end up valid.
+func TestConcurrentSaves(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "instances.json")
+	now := time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			in := provider.Instance{ID: fmt.Sprintf("id-%d", i), Name: fmt.Sprintf("rig-x%d", i), IP: "1.2.3.4", Status: "running"}
+			if err := Put(path, in, now); err != nil {
+				t.Errorf("Put %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if _, err := Read(path, now); err != nil {
+		t.Fatalf("Read after concurrent saves: %v", err)
+	}
+	left, _ := filepath.Glob(filepath.Join(filepath.Dir(path), "*.tmp"))
+	if len(left) != 0 {
+		t.Errorf("temp files left behind: %v", left)
 	}
 }
