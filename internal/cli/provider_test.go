@@ -84,7 +84,7 @@ func TestUnknownProviderNamesRegistered(t *testing.T) {
 	root := NewRoot()
 	root.SetArgs([]string{"--provider", "nope", "status"})
 	err := root.Execute()
-	want := `unknown provider "nope" (have: testfake, verda)`
+	want := `unknown provider "nope" (have: aws, runpod, testfake, vast, verda)`
 	if err == nil || err.Error() != want {
 		t.Errorf("err = %v\nwant %s", err, want)
 	}

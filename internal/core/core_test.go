@@ -76,6 +76,22 @@ func TestPickOrdersTypesThenVolumeLocationsThenAlphabetical(t *testing.T) {
 	}
 }
 
+func TestPickMatchesTypeTokensCaseInsensitively(t *testing.T) {
+	// marketplace tokens (1xRTX-4090) are typed by hand; the provider's
+	// spelling is what the create request must carry
+	prov := fake.New()
+	prov.Avail = map[string][]string{"US-TX-3": {"1xRTX-4090"}}
+	app, _ := newApp(t, prov)
+
+	got, err := app.Pick(context.Background(), UpSpec{Types: []string{"1xrtx-4090"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != (Candidate{Type: "1xRTX-4090", Location: "US-TX-3"}) {
+		t.Errorf("Pick = %v, want the provider's spelling in US-TX-3", got)
+	}
+}
+
 func TestPickHonoursLocationPin(t *testing.T) {
 	prov := fake.New()
 	prov.Avail = map[string][]string{"FIN-01": {"1H100.80S.30V"}, "ICE-01": {"1H100.80S.30V"}}

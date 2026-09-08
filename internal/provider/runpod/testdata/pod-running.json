@@ -1,0 +1,27 @@
+{
+ "actions": ["stop", "restart", "terminate"],
+ "args": "",
+ "cloud": "SECURE",
+ "cost": 0.5,
+ "createdAt": "2026-09-08T09:12:33Z",
+ "dataCenterId": "EU-CZ-1",
+ "disk": 20,
+ "env": {"PUBLIC_KEY": "ssh-ed25519 AAAA rig"},
+ "gpu": {"count": 1, "id": "NVIDIA GeForce RTX 3090", "memory": 31, "vcpuCount": 6},
+ "id": "9wxg5cwn7lhd2t",
+ "image": "runpod/pytorch:1.2.0-rc.162-cu1290-torch291-ubuntu2404",
+ "mounts": {"network": [{"path": "/workspace", "volumeId": "nv-abc123"}]},
+ "name": "rig-smoke",
+ "ports": ["22/tcp"],
+ "runtime": {
+  "cpu": {"util": 0}, "memory": {"util": 0},
+  "gpus": [{"util": 0, "memoryUtil": 0}],
+  "ports": [{"ip": "213.192.2.92", "private": 22, "public": 40076, "type": "tcp"}],
+  "uptime": 61
+ },
+ "ssh": {
+  "direct": {"host": "213.192.2.92", "port": 40076, "username": "root", "command": "ssh root@213.192.2.92 -p 40076"},
+  "proxy": {"host": "ssh.runpod.io", "port": 22, "username": "9wxg5cwn7lhd2t-64411a6b", "command": "ssh 9wxg5cwn7lhd2t-64411a6b@ssh.runpod.io"}
+ },
+ "status": "RUNNING"
+}

@@ -14,6 +14,9 @@ import (
 	"github.com/dtuit/rig/internal/tui"
 
 	// drivers register themselves with the provider registry on import
+	_ "github.com/dtuit/rig/internal/provider/aws"
+	_ "github.com/dtuit/rig/internal/provider/runpod"
+	_ "github.com/dtuit/rig/internal/provider/vast"
 	_ "github.com/dtuit/rig/internal/provider/verda"
 )
 

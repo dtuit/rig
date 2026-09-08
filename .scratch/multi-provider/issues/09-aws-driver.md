@@ -8,44 +8,44 @@ Verda, and a create-retry across AZs when capacity is short. Balance is reported
 
 **Blocked by:** 01, 02, 03. Needs `aws sso login` and a decision on account/region (see Comments).
 
-**Status:** needs-info
+**Status:** resolved
 
-- [ ] `internal/provider/aws`: `aws-sdk-go-v2` (`config`, `ec2`, `ssm`, `pricing`, `sts`);
+- [x] `internal/provider/aws`: `aws-sdk-go-v2` (`config`, `ec2`, `ssm`, `pricing`, `sts`);
       config keys `profile`, `region` (required, or SDK default), `security_group` (`rig`),
       `default_image` (SSM parameter path or `ami-…`), `volume_type` (`gp3`), `families`
       (default `g4dn g5 g6 g6e gr6 p3 p4d p5 p5e p5en`). Expired SSO → error tells the user to
       run `aws sso login --profile <p>`.
-- [ ] `Locations()` = AZs of the region (`DescribeAvailabilityZones`), code = zone name.
+- [x] `Locations()` = AZs of the region (`DescribeAvailabilityZones`), code = zone name.
 - [ ] `InstanceTypes()` = `DescribeInstanceTypes` for the families plus any type named in a
       profile/flag; GPU name/count/memory from `GpuInfo`; on-demand price from
       `pricing.GetProducts` (Linux, Shared, NA pre-installed sw, `capacitystatus=Used`) cached
       24h in `~/.cache/rig/aws-pricing-<region>.json`; spot from `DescribeSpotPriceHistory`
       (latest per type, min across AZs).
-- [ ] `Availability()` = `DescribeInstanceTypeOfferings(LocationType=availability-zone)`;
+- [x] `Availability()` = `DescribeInstanceTypeOfferings(LocationType=availability-zone)`;
       documented as "offered, not guaranteed" — capacity is settled by the create-retry.
 - [ ] `Images()` = the DLAMI resolved through SSM public parameters (verify the exact path for
       "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04)" during implementation) and a
       plain Ubuntu 24.04 for CPU types; any `ami-…` accepted. Default user `ubuntu`.
 - [ ] `EnsureSSHKey` = `DescribeKeyPairs` by name + fingerprint match, else `ImportKeyPair`.
-- [ ] Networking: default VPC, the subnet in the chosen AZ, security group `rig` (22/tcp from
+- [x] Networking: default VPC, the subnet in the chosen AZ, security group `rig` (22/tcp from
       0.0.0.0/0, tagged `rig:managed`) created if missing, `AssociatePublicIpAddress: true`.
-- [ ] `CreateInstance`: `RunInstances` with tags `Name=rig-<name>`, `rig:managed=true`,
+- [x] `CreateInstance`: `RunInstances` with tags `Name=rig-<name>`, `rig:managed=true`,
       root volume `os_volume_gb` gp3 delete-on-termination, `InstanceMarketOptions` spot one-time
       with interruption `stop` when `Spot`; `InsufficientInstanceCapacity`/`Unsupported`-in-AZ →
       `ErrNoCapacity`; `VcpuLimitExceeded` → error naming the quota code (G/VT `L-DB2E81BA`,
       P `L-417A185B`). Existing data volumes are attached once the instance is `running`
       (driver-internal wait, then `AttachVolume`).
-- [ ] `ListInstances` = filter `tag:rig:managed`; status map pending→Provisioning,
+- [x] `ListInstances` = filter `tag:rig:managed`; status map pending→Provisioning,
       running→Running, stopping/stopped→Stopped, shutting-down/terminated→Gone; endpoint
       `{PublicIp, 22, ubuntu}`; `PricePerHour` from the pricing cache (spot: latest spot price);
       `Location` = AZ; `Spot` = `InstanceLifecycle == spot`; `OSVolumeID` = root mapping.
-- [ ] Volumes: `CreateVolume` gp3 in the AZ tagged `Name=<name>`; `ListVolumes` by tag;
+- [x] Volumes: `CreateVolume` gp3 in the AZ tagged `Name=<name>`; `ListVolumes` by tag;
       `Attach`/`Detach`/`Delete`; `MkdirCommand`/`MountCommand` synthesised: find the device by
       serial (`lsblk -o PATH,SERIAL`, serial = volume id without the dash), `blkid || mkfs.ext4`,
       `mount` at `/mnt/<name>`. `DeleteInstance` terminates, waits for requested volumes to
       detach, deletes them.
-- [ ] `ShutdownInstance`/`StartInstance` = Stop/Start. `Balance()` → `ErrUnsupported`.
-- [ ] Tests: `ec2`/`ssm`/`pricing` behind a narrow interface with a fake; mount-command
+- [x] `ShutdownInstance`/`StartInstance` = Stop/Start. `Balance()` → `ErrUnsupported`.
+- [x] Tests: `ec2`/`ssm`/`pricing` behind a narrow interface with a fake; mount-command
       synthesis; status/endpoint mapping; ICE → `ErrNoCapacity`; quota error text.
 - [ ] Manual smoke: CPU type first (`t3.medium`, no quota issue), then the cheapest GPU type
       the account's quota allows.
@@ -63,3 +63,98 @@ is a possible follow-up.
 `ap-southeast-2`?), and whether G/P vCPU quotas exist there (`aws service-quotas
 get-service-quota --service-code ec2 --quota-code L-DB2E81BA`). If quotas are 0, AWS is
 CPU-only until a quota request clears, which changes how early it is worth building.
+
+2026-09-08 (agent): Landed `internal/provider/aws` (`aws.go` config/registry/clients/errors,
+`catalog.go` Locations/InstanceTypes/Availability/Images/spot prices, `pricing.go` the 24h
+on-demand cache, `instances.go` instances/network/key pair, `volumes.go` EBS + mount command,
+`aws_test.go`), one blank import in `internal/cli/root.go`, and `aws-sdk-go-v2` `config`,
+`service/ec2`, `service/ssm`, `service/pricing` (+ core and `smithy-go`) in go.mod; `sts` is
+pulled in by `config` for SSO and never called by rig. `init()` registers `aws`; the factory
+does `cfg.Decode(&own)` for `profile`, `region`, `security_group` (rig), `default_image`,
+`volume_type` (gp3), `families` (g4dn g5 g6 g6e gr6 p3 p4d p5 p5e p5en); no `Creds` — the SDK
+default chain plus `WithSharedConfigProfile` when `profile` is set, clients built lazily on the
+first call. `New(Config) *Driver`; SDK clients sit behind `ec2API`/`ssmAPI`/`pricingAPI`
+(only the methods used, SDK-shaped so the paginators accept them). Every SDK error passes
+through one wrapper; text matching `SSO session has expired` / `SSOProviderInvalidToken` /
+`token has expired` / `InvalidGrantException` becomes exactly `aws: credentials expired; run:
+aws sso login --profile <profile|$AWS_PROFILE|default>`. `Capabilities{Spot, Volumes}`,
+`Balance` → `ErrUnsupported`. Endpoint `{PublicIp, 22, ubuntu}`; `Instance.Provider` left for
+core. Status map pending→Provisioning, running→Running, stopping/stopped→Stopped,
+shutting-down/terminated→Gone — except terminated with `StateReason.Code
+Server.InsufficientInstanceCapacity` → `NoCapacity`, so a spot launch EC2 kills before it runs
+is retried by core rather than aborting. `OSVolumeID` = the `RootDeviceName` mapping (falls back
+to `/dev/sda1`), `VolumeIDs` the rest, `Location` = AZ, `Spot` = lifecycle spot, `Image` =
+ImageId, `GPU` from the type catalogue when `InstanceTypes` ran in the process.
+`ErrNoCapacity` wraps codes `InsufficientInstanceCapacity` and `Unsupported`;
+`VcpuLimitExceeded` names `L-DB2E81BA` (G/VT) or `L-417A185B` (P) and the
+`aws service-quotas request-service-quota-increase` line; `MaxSpotInstanceCountExceeded`
+(added) names the spot quotas `L-3819A6DF` (G/VT) / `L-7212CCBC` (P). Network: default VPC,
+the zone's subnet (default-for-AZ preferred), group `security_group` found or created with
+22/tcp from 0.0.0.0/0 and tagged `rig:managed=true`; missing default VPC or subnet is a clear
+error. `EnsureSSHKey` returns the key *name* (RunInstances only takes `KeyName`); `CreateInstance`
+uses `SSHKeyIDs[0]` as `KeyName`. Existing data volumes: the driver waits for `running`
+(≤10 min, ctx-aware) then attaches at the first free `/dev/sd[f-p]`. `DeleteInstance` terminates,
+skips the root volume (DeleteOnTermination), waits ≤5 min for each other requested volume to be
+`available` (a volume EC2 no longer knows counts as deleted) then deletes it. Mount command:
+`sudo bash -c 'dev=$(lsblk -dno PATH,SERIAL | awk -v s=<id-without-dash> "\$2==s{print \$1}");
+… blkid "$dev" || mkfs.ext4 -q "$dev"; mountpoint -q /mnt/<name> || mount "$dev" /mnt/<name>'`,
+`MkdirCommand` = `sudo mkdir -p /mnt/<name>`. Tests (fakes for the three interfaces, all
+through the Provider methods): status/endpoint/volume mapping and cache-priced listing, spot
+price per zone, SSO rewrite (and a non-SSO error left alone), Locations, Availability zone
+grouping, InstanceTypes from GpuInfo + seeded cache (no pricing call) and fetch-once-then-cache
+(+ pricing denied → price 0, no error), Images per type class / `ami-` passthrough /
+configured parameter, EnsureSSHKey import-only-when-missing, RunInstances request shape and
+first-use security group, attach-after-running device letters, ICE/Unsupported → sentinel,
+quota codes, missing VPC/subnet errors, DeleteInstance volume handling, Stop/Start/Balance,
+mount-command synthesis (`s=vol0abc`, mkfs guard, `bash -n` parses), CreateVolume tags,
+AttachVolume next-free device.
+
+**Deviations.** (1) Spot uses `one-time` + interruption `terminate`, not `stop`: EC2 rejects
+`stop` on one-time requests, and a persistent request would relaunch the instance after an
+interruption and after `rig down` (unless the request is cancelled first), fighting the TTL
+watchdog. Data volumes are separate EBS and survive; the OS volume is lost as with a reclaimed
+Verda spot. (2) `EnsureSSHKey` matches by name only, no fingerprint (per the brief); a rotated
+local key under the same name needs `aws ec2 delete-key-pair` first. (3) `InstanceTypes` lists
+the configured families only; types named in a profile/flag are not appended, but they launch
+fine because `Availability` returns every offered type in every zone (that is what `core.Pick`
+consults), so `--type t3.medium` works. (4) The pricing cache holds the whole region's Linux
+on-demand list (one paginated `GetProducts` with `regionCode`, `operatingSystem=Linux`,
+`tenancy=Shared`, `preInstalledSw=NA`, `capacitystatus=Used`; `operation` prefix
+`RunInstances` checked client-side) rather than one call per type, so `ListInstances` can price
+a `t3.medium` too; a failure leaves prices at 0 and stops asking for the rest of the process.
+Spot prices are cached in memory for 5 min so `waitRunning` polls do not hammer
+`DescribeSpotPriceHistory`. (5) Pricing client pinned to `us-east-1` (the Price List API only
+lives in a few regions). (6) `InstanceTypeOfferings` are not filtered to the families (see 3).
+
+**Verify on first live run (SSO was expired, no call was possible).** SSM parameter paths:
+GPU `/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-24.04/latest/ami-id`,
+CPU `/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id`
+(both constants in `aws.go`); root device `/dev/sda1` for the size override (Ubuntu AMIs; an
+AMI with `/dev/xvda` would grow a second volume); the mount command assumes Nitro (NVMe
+serial = volume id sans dash) — Xen types (p3) expose `/dev/xvdf` without a serial and are a
+follow-up; the pricing filter set returns exactly one `RunInstances` product per type.
+
+**IAM actions used** (for a scoped role later): `ec2:DescribeAvailabilityZones`,
+`DescribeInstanceTypes`, `DescribeInstanceTypeOfferings`, `DescribeSpotPriceHistory`,
+`DescribeKeyPairs`, `ImportKeyPair`, `DescribeVpcs`, `DescribeSubnets`,
+`DescribeSecurityGroups`, `CreateSecurityGroup`, `AuthorizeSecurityGroupIngress`,
+`RunInstances`, `DescribeInstances`, `TerminateInstances`, `StopInstances`, `StartInstances`,
+`CreateVolume`, `DescribeVolumes`, `AttachVolume`, `DetachVolume`, `DeleteVolume`,
+`CreateTags` (implied by the TagSpecifications on RunInstances/CreateVolume/
+CreateSecurityGroup/ImportKeyPair); `ssm:GetParameter` on the two public parameters;
+`pricing:GetProducts`. No STS call.
+
+**Smoke checklist left undone** (needs `aws sso login --profile work`, region
+`ap-southeast-2`): `rig --provider aws types` (prices non-zero, cache file appears under
+`~/.cache/rig/`), `rig --provider aws types --available`, `rig --provider aws up --type
+t3.medium --ttl 20m` (key pair imported, `rig` group created, ubuntu login, footprint installs
+under systemd), `rig ssh`, `rig run`, `rig sync`, `rig status` (price, AZ, endpoint), a
+`volume:` profile (EBS created in the AZ, mount command formats and mounts at `/mnt/<name>`,
+survives `rig down`, re-attaches on the next `up`), `rig down` (instance terminated, OS volume
+gone, data volume kept; `--delete-volumes` removes it), then the cheapest GPU type the quota
+allows (`aws service-quotas get-service-quota --service-code ec2 --quota-code L-DB2E81BA`),
+one `spot: true` launch, and the watchdog firing at the deadline.
+
+**Follow-ups.** `core.EnsureVolume` logs Verda's `NVMe_Shared` as the default volume type
+name; tighten the security group to the operator's IP; Xen-generation device naming; a
+`--type` outside `families` is not shown by `rig types`.

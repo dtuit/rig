@@ -1,0 +1,4 @@
+{"networkVolumes":[
+ {"id":"nv-abc123","name":"data","size":50,"dataCenter":"EU-CZ-1","type":"STANDARD"},
+ {"id":"nv-def456","name":"scratch","size":10,"dataCenter":"US-TX-3","type":"HIGH_PERFORMANCE"}
+]}

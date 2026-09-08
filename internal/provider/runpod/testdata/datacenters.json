@@ -1,0 +1,53 @@
+{
+ "dataCenters": [
+  {
+   "compliance": [
+    "ISO_IEC_27001"
+   ],
+   "globalNetwork": true,
+   "id": "CA-MTL-1",
+   "name": "CA-MTL-1",
+   "networkVolumeTypes": [],
+   "region": "NORTH_AMERICA"
+  },
+  {
+   "compliance": [
+    "GDPR",
+    "HIPAA"
+   ],
+   "globalNetwork": true,
+   "id": "EU-CZ-1",
+   "name": "EU-CZ-1",
+   "networkVolumeTypes": [],
+   "region": "EUROPE"
+  },
+  {
+   "compliance": [
+    "GDPR",
+    "HIPAA"
+   ],
+   "globalNetwork": true,
+   "id": "EU-RO-1",
+   "name": "EU-RO-1",
+   "networkVolumeTypes": [
+    "STANDARD"
+   ],
+   "region": "EUROPE"
+  },
+  {
+   "compliance": [
+    "GDPR",
+    "ISO_IEC_27001",
+    "SOC_2_TYPE_2",
+    "HIPAA"
+   ],
+   "globalNetwork": true,
+   "id": "US-TX-3",
+   "name": "US-TX-3",
+   "networkVolumeTypes": [
+    "STANDARD"
+   ],
+   "region": "NORTH_AMERICA"
+  }
+ ]
+}

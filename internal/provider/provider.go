@@ -130,6 +130,7 @@ type CreateInstanceRequest struct {
 	Location        string
 	Spot            bool
 	SSHKeyIDs       []string
+	PublicKey       string // rig's ssh public key text; container providers inject it at create (EnsureSSHKey returns "")
 	ExistingVolumes []string
 	OSVolumeGB      int // 0 = provider default
 }

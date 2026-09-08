@@ -1,0 +1,81 @@
+{
+ "actions": [
+  "stop",
+  "restart",
+  "terminate"
+ ],
+ "args": "bash -c '[ -f ~/.rig/onstart.sh ] && bash ~/.rig/onstart.sh; exec /start.sh'",
+ "cloud": "SECURE",
+ "cost": 0.74,
+ "createdAt": "2026-09-08T11:00:07.841Z",
+ "cudaVersion": "13.0",
+ "dataCenterId": "EU-CZ-1",
+ "disk": 20,
+ "env": {
+  "PUBLIC_KEY": "ssh-ed25519 AAAA rig"
+ },
+ "globalNetworking": {
+  "enabled": false
+ },
+ "gpu": {
+  "count": 1,
+  "id": "NVIDIA GeForce RTX 4090",
+  "memory": 125,
+  "vcpuCount": 32
+ },
+ "id": "wz1qj98m73wfve",
+ "image": "runpod/pytorch:1.2.0-rc.162-cu1290-torch291-ubuntu2404",
+ "locked": false,
+ "mounts": {},
+ "name": "rig-smoke",
+ "ports": [
+  "22/tcp"
+ ],
+ "registry": null,
+ "runtime": {
+  "cpu": {
+   "util": 0
+  },
+  "gpus": [
+   {
+    "memoryUtil": 0,
+    "util": 0
+   }
+  ],
+  "memory": {
+   "util": 0
+  },
+  "ports": [
+   {
+    "ip": "213.192.2.102",
+    "private": 22,
+    "public": 40088,
+    "type": "tcp"
+   },
+   {
+    "ip": "100.65.26.77",
+    "private": 19123,
+    "public": 60609,
+    "type": "http"
+   }
+  ],
+  "uptime": 44
+ },
+ "ssh": {
+  "direct": {
+   "command": "ssh root@213.192.2.102 -p 40088",
+   "host": "213.192.2.102",
+   "port": 40088,
+   "username": "root"
+  },
+  "proxy": {
+   "command": "ssh wz1qj98m73wfve-64411a4d@ssh.runpod.io",
+   "host": "ssh.runpod.io",
+   "port": 22,
+   "username": "wz1qj98m73wfve-64411a4d"
+  }
+ },
+ "startedAt": "2026-09-08T11:00:07.836Z",
+ "status": "RUNNING",
+ "template": null
+}

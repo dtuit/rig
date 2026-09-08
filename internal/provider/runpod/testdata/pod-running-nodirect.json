@@ -1,0 +1,20 @@
+{
+ "actions": ["stop", "restart", "terminate"],
+ "cloud": "SECURE",
+ "cost": 0.5,
+ "createdAt": "2026-09-08T09:12:33Z",
+ "dataCenterId": "EU-CZ-1",
+ "disk": 20,
+ "gpu": {"count": 1, "id": "NVIDIA GeForce RTX 3090", "memory": 31, "vcpuCount": 6},
+ "id": "9wxg5cwn7lhd2t",
+ "image": "runpod/pytorch:1.2.0-rc.162-cu1290-torch291-ubuntu2404",
+ "mounts": null,
+ "name": "rig-smoke",
+ "ports": ["22/tcp"],
+ "runtime": {
+  "ports": [{"ip": "213.192.2.92", "private": 22, "public": 40076, "type": "tcp"}],
+  "uptime": 61
+ },
+ "ssh": {"direct": null, "proxy": null},
+ "status": "RUNNING"
+}

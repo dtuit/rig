@@ -254,13 +254,17 @@ func (a *App) Pick(ctx context.Context, spec UpSpec) ([]Candidate, error) {
 		}
 	}
 	var out []Candidate
-	for _, t := range spec.Types {
+	for _, want := range spec.Types {
+		// tokens are typed by hand (1xrtx-4090); the provider's spelling is
+		// what the create request must carry
+		t := want
 		var locs []string
 		for l, types := range avail {
 			if spec.Location != "" && l != spec.Location {
 				continue
 			}
-			if slices.Contains(types, t) {
+			if i := slices.IndexFunc(types, func(x string) bool { return strings.EqualFold(x, want) }); i >= 0 {
+				t = types[i]
 				locs = append(locs, l)
 			}
 		}
@@ -415,6 +419,7 @@ func (a *App) provision(ctx context.Context, spec UpSpec) (*provider.Instance, [
 			Location:        c.Location,
 			Spot:            spec.Spot,
 			SSHKeyIDs:       []string{keyID},
+			PublicKey:       pubkey,
 			ExistingVolumes: volumes,
 			OSVolumeGB:      spec.OSGB,
 		})
