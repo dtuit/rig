@@ -221,6 +221,20 @@ var offerGone = regexp.MustCompile(`(?i)no_such_ask|not found|no longer|unavaila
 // billingProblem matches the answers no other offer will fix.
 var billingProblem = regexp.MustCompile(`(?i)credit|balance|payment|billing|fund`)
 
+// runtypeFor is how the rental asks Vast to serve sshd. Direct ssh needs a
+// host port, so a host advertising none can only be asked for the proxy:
+// live 2026-09-08 a rental of a `direct_port_count: 0` offer with
+// "ssh_direc ssh_proxy" sat in loading for ever with status_msg
+// `docker: invalid hostPort: -1`, and dropping the port request alone did
+// not help — the direct runtype maps the port too. "ssh_direc" is upstream's
+// own abbreviated spelling (confirmed against Vast's CLI), not a typo here.
+func runtypeFor(o offer) string {
+	if o.DirectPortCount > 0 {
+		return "ssh_direc ssh_proxy"
+	}
+	return "ssh_proxy"
+}
+
 // CreateInstance rents the cheapest offer matching the token in the
 // requested geolocation, moving to the next when one turns out to be
 // taken; when every offer is gone it reports ErrNoCapacity so core tries
@@ -240,12 +254,24 @@ func (d *Driver) CreateInstance(ctx context.Context, req provider.CreateInstance
 		"gpu_name": map[string]any{"eq": gpu},
 		"num_gpus": map[string]any{"eq": n},
 	}
-	if req.Location != "" {
-		clauses["geolocation"] = map[string]any{"eq": req.Location}
+	// A location pin narrows the search to its country (all the offer
+	// filter understands) and is then matched exactly, so a pin never
+	// rents a cheaper host in the same country.
+	if cc := countryCode(req.Location); cc != "" {
+		clauses["geolocation"] = map[string]any{"eq": cc}
 	}
-	offers, err := d.search(ctx, d.query(typ, clauses))
+	offers, err := d.searchAll(ctx, typ, clauses)
 	if err != nil {
 		return nil, err
+	}
+	if req.Location != "" {
+		kept := make([]offer, 0, len(offers))
+		for _, o := range offers {
+			if matchesLocation(o.Geolocation, req.Location) {
+				kept = append(kept, o)
+			}
+		}
+		offers = kept
 	}
 	where := req.Location
 	if where == "" {
@@ -265,17 +291,18 @@ func (d *Driver) CreateInstance(ctx context.Context, req provider.CreateInstance
 	var last error
 	for _, o := range offers {
 		body := map[string]any{
-			"client_id": "me",
-			"image":     image,
-			"disk":      disk,
-			"label":     req.Name,
-			// "ssh_direc" is how Vast's own CLI spells it (abbreviated
-			// upstream, not a typo here): direct ssh with the proxy as the
-			// fallback. Do not "correct" it.
-			"runtype":        "ssh_direc ssh_proxy",
-			"env":            map[string]string{"-p 22:22": "1"},
+			"client_id":      "me",
+			"image":          image,
+			"disk":           disk,
+			"label":          req.Name,
+			"runtype":        runtypeFor(o),
 			"onstart":        onstart,
 			"cancel_unavail": true,
+		}
+		// Ask for the container's sshd on a host port only where the host
+		// has ports to give (see runtypeFor).
+		if o.DirectPortCount > 0 {
+			body["env"] = map[string]string{"-p 22:22": "1"}
 		}
 		price := o.DPHTotal
 		if req.Spot {

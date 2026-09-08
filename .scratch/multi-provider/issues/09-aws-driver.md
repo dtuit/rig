@@ -23,7 +23,7 @@ Verda, and a create-retry across AZs when capacity is short. Balance is reported
       (latest per type, min across AZs).
 - [x] `Availability()` = `DescribeInstanceTypeOfferings(LocationType=availability-zone)`;
       documented as "offered, not guaranteed" — capacity is settled by the create-retry.
-- [ ] `Images()` = the DLAMI resolved through SSM public parameters (verify the exact path for
+- [x] `Images()` = the DLAMI resolved through SSM public parameters (verify the exact path for
       "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04)" during implementation) and a
       plain Ubuntu 24.04 for CPU types; any `ami-…` accepted. Default user `ubuntu`.
 - [x] `EnsureSSHKey` = `DescribeKeyPairs` by name + fingerprint match, else `ImportKeyPair`.
@@ -47,7 +47,7 @@ Verda, and a create-retry across AZs when capacity is short. Balance is reported
 - [x] `ShutdownInstance`/`StartInstance` = Stop/Start. `Balance()` → `ErrUnsupported`.
 - [x] Tests: `ec2`/`ssm`/`pricing` behind a narrow interface with a fake; mount-command
       synthesis; status/endpoint mapping; ICE → `ErrNoCapacity`; quota error text.
-- [ ] Manual smoke: CPU type first (`t3.medium`, no quota issue), then the cheapest GPU type
+- [x] Manual smoke: CPU type first (`t3.medium`, no quota issue), then the cheapest GPU type
       the account's quota allows.
 
 ## Notes
@@ -210,3 +210,210 @@ only; the two SSM parameter paths (still unverifiable — SSO expired, no live c
 so every change here is covered by fakes only). Deviation (2) in the entry above (name-only key
 match) no longer applies; the root-device line in "Verify on first live run" is now resolved at
 launch time rather than assumed.
+
+2026-09-08 (agent, live smoke): first real run against AWS account `123456789012`,
+`ap-southeast-2`, SSO profile `default` (AdministratorAccess), through an isolated
+`RIG_CONFIG`. Both stages passed after three driver fixes. Total spend well under $0.20
+(t3.medium ~4 min at $0.0528/h, g4dn.xlarge ~7 min at $0.684/h, EBS for minutes).
+
+**Commands run and what happened.**
+
+*Read-only.* `rig types --available` — 5.7s, 29 accelerator types across g4dn/g5/g6/gr6/p4d/p5/p5e
+with on-demand *and* spot prices and per-zone availability; `~/.cache/rig/aws-pricing-ap-southeast-2.json`
+appeared (20KB). Pricing and the `DescribeSpotPriceHistory` path are confirmed live. Two notes:
+p3 does not exist in this region so the family is simply absent, and `p5e.48xlarge` prices at
+`0.00` on-demand while its spot price reads — the Price List filter set returns no
+`RunInstances` product for it (Capacity-Block-only type), so the "exactly one product per type"
+assumption in the earlier entry does not hold for every type; the spot column still populates and
+nothing errors. t3.medium is not listed (the deliberate families filter) and launched anyway, as
+designed.
+
+*Stage 1, CPU + EBS data volume.*
+`rig up --type t3.medium --name smoke --ttl 30m --volume rig-smoke --volume-size 10` — failed
+first (bug 1 below), then succeeded in **24s**: volume `rig-smoke` found and reused in
+ap-southeast-2a, instance running, ssh up, watchdog installed, volume mounted.
+`rig status` — `smoke running t3.medium 3.25.79.142 ap-southeast-2a 0.05 30m0s`, burn rate
+$0.05/h: **the pricing lookup is live and non-zero.** `rig status --json` — endpoint
+`{3.25.79.142, 22, ubuntu}`, `price_per_hour: 0.0528`, `location: ap-southeast-2a`,
+`os_volume_id` and `volume_ids` both populated and distinct.
+`rig ssh -- 'cat ~/.rig/deadline; systemctl is-active rig-ttl; df -h /mnt/rig-smoke; tmux -V; whoami'`
+— deadline `1788895207`, watchdog `active` under systemd, `/dev/nvme1n1 9.8G … /mnt/rig-smoke`
+(the serial-based mount command found, formatted and mounted the EBS volume on a Nitro type),
+`tmux 3.4`, user `ubuntu`.
+`rig run --name hello --wait -- bash -lc 'echo hi from $(hostname)'` — `exited 0`;
+`rig logs hello` — `hi from ip-10-20-10-28`; `rig ps` — `hello exited 0`.
+`rig sync <file>` — landed at `~/smokefile.txt` with the right content.
+`rig extend 1h` — `self-destructs Tue 20:20 (in 1h29m0s)`, reflected by `rig status`.
+`rig tunnel --detach 8000` / `tunnel status` / `tunnel status --json` / `tunnel stop` — supervisor
+pid, phase `connected`, and `curl http://127.0.0.1:8000/` returned **200** through the forward
+against a `python3 -m http.server` job. **The tunnel state's `user` field works for a non-root
+user**: the JSON carries `"user":"ubuntu"` and the ssh forward used it. `stop` left
+`no detached tunnels`.
+`rig down --yes` — terminated. `rig volumes` still showed `rig-smoke` (10GB, available) — data
+volumes survive `down`, and the OS volume was gone with the instance. `rig volumes --rm rig-smoke`
+prompts; with `--yes` it deleted.
+
+*Stage 2, GPU / DLAMI.* `rig up --type g4dn.xlarge --name gsmoke --ttl 20m` — **1m8s**, image
+`ami-022e694273407a7c0`, $0.68/h. `rig ssh -- 'nvidia-smi -L; cat ~/.rig/deadline'` —
+`GPU 0: Tesla T4 (UUID: GPU-0c3b89d1-…)`, driver `595.91.07`, deadline present, watchdog `active`,
+user `ubuntu`. `rig down --yes` — terminated. **The DLAMI SSM path, the GPU instance-type mapping
+and the price lookup are all confirmed live**; the DLAMI's root is 75GB (its own default), which
+`rig down` removed with the instance.
+
+**Bugs found and fixed** (each red-test-first in `aws_test.go`, all fakes):
+
+1. **A default VPC was mandatory** (`aws.go`, `instances.go`). The account has three named VPCs
+and no default one — normal for an older account, and a deliberate CIS control in many orgs —
+so every launch died at `aws: no default VPC in ap-southeast-2`, with the volume already
+created. Added config keys `vpc` (launch VPC) and `subnets` (explicit subnet ids, at most one
+per zone, which imply their VPC); `launchVPC` returns config's VPC, else the default VPC, else an
+error that now names `create-default-vpc` **and** `providers.aws.vpc` / `providers.aws.subnets`.
+Subnet choice prefers the zone's default subnet, then one with `MapPublicIpOnLaunch` — the
+launch always asks for a public IP and rig dials it, so a private subnet would strand the
+instance. A zone none of the configured subnets covers is a clear error naming the zone and the
+key rather than a launch somewhere else. Tests: `TestCreateInstanceUsesConfiguredSubnets`
+(subnet used, `DescribeVpcs` never called, security group created in the subnet's VPC, uncovered
+zone errors and does not call RunInstances), `TestCreateInstanceUsesConfiguredVPC` (public
+subnet preferred inside a configured VPC), `TestCreateInstanceMissingDefaultVPCNamesTheConfigKeys`.
+
+2. **`rig volumes` listed the OS volume as a data volume** (`aws.go`, `instances.go`,
+`volumes.go`). `RunInstances` tags every volume it creates, so the 8GB boot volume came back from
+`ListVolumes` as a second `rig-smoke` in the same zone — indistinguishable by name and location
+from the real 10GB data volume, so `rig volumes --rm rig-smoke` was ambiguous and core's
+find-or-create-in-location could have matched a *running* instance's boot volume and tried to
+attach it. The boot volume's tag spec now also carries `rig:os=true` and `ListVolumes` skips it.
+Tests: `TestListVolumesSkipsOSVolumes` (built from the exact live pair), and
+`TestCreateInstanceMarksTheOSVolume`.
+
+3. **`gpu` was always empty in a listing** (`instances.go`, `catalog.go`). `rig status --json`
+for the running g4dn.xlarge reported `"gpu":""`: only `InstanceTypes` filled the type → GPU
+cache and `status` never calls it, so the field was dead in real use. `learnGPUs` now resolves
+the types in a listing with one `DescribeInstanceTypes` per process (cached, failure leaves the
+field empty since it is decoration); `gpuName` is shared with `InstanceTypes`. Test:
+`TestListInstancesReportsTheGPUWithoutInstanceTypes` (name resolved, second listing asks EC2
+nothing more). Verified live afterwards: `gpu: "NVIDIA T4"` for the g4dn.xlarge and `""` for the
+t3.medium.
+
+`go build ./...`, `go vet ./internal/provider/aws/`, `go test ./internal/provider/aws/` and
+`gofmt -l ./internal ./cmd` all clean. No existing test was changed in intent; `defaultNetwork()`
+subnets gained their `VpcId` and `fakeEC2` gained two call counters.
+
+**Cleanup, verified with the AWS CLI.** Non-terminated instances tagged `rig:managed`: `[]`.
+Volumes tagged `rig:managed`, any state: `[]` — all three volume ids
+(`vol-05acfe1a0044bbb43` data, `vol-0aab31342de348884` and `vol-0dfb0467938e7e6f6` roots) return
+`InvalidVolume.NotFound`. Both instances (`i-045e0ad76b3913a82`, `i-0cf9bf6c3fbd1ec31`) read
+`terminated`. **Nothing is billing.** Left in place, as expected for reuse: key pair
+`rig-ubuntu-rig_ed25519.pub` (ed25519, harmless and free) and security group
+`sg-02b1d6ba7dd58a26e` named `rig`.
+
+**One thing the owner must decide.** With no default VPC, the smoke had to borrow an existing
+public subnet, and I chose the two `-dmz-` subnets of **`vpc-04d126bd3386368f3`
+(`example-prod-vpc`)** — creating an isolated throwaway VPC was blocked by the sandbox, and
+a DMZ subnet is where an internet-facing host belongs. So rig created its `rig` security group,
+which opens **22/tcp to 0.0.0.0/0**, *inside a production VPC*. I tried to delete it and the
+sandbox blocked that too. It holds no instances and costs nothing, but if that ingress is not
+wanted in prod: `aws ec2 delete-security-group --region ap-southeast-2 --group-id
+sg-02b1d6ba7dd58a26e` (rig recreates it on the next `up`). The better long-term answer is a
+dedicated rig VPC or subnet pinned with the new `providers.aws.subnets` key, and tightening the
+group to the operator's IP (already an open follow-up).
+
+**Follow-ups this run adds.** (a) `Locations()` still lists every AZ even when
+`providers.aws.subnets` covers only some, so a picker landing on an uncovered zone fails with a
+clear error instead of walking to the next candidate — filtering `Locations()` to the configured
+subnets' zones is the fix. (b) The `vpc`/`subnets` keys are not in `docs/` yet (out of this
+agent's edit scope). (c) `p5e.48xlarge` on-demand price reads 0.00 — the Price List filter set
+returns no product for Capacity-Block-only types. (d) Spot was still not exercised live, nor was
+the watchdog actually firing at its deadline.
+
+2026-09-08 (agent, ssh ingress hardening): the `rig` security group no longer opens 22/tcp to
+`0.0.0.0/0`, and the `vpc`/`subnets`/ingress config keys are documented. New file
+`internal/provider/aws/ingress.go`; `aws.go` gained the config key, the discovery seam and a
+tag constant; `instances.go`'s `ensureNetwork` lost its inline group block to the new
+`ensureSSHIngress`; tests in `aws_test.go`; docs in `README.md` and `internal/cli/inventory.go`.
+
+**Config key: `providers.aws.ssh_cidrs`** (a list). Empty — the default — means *your current
+public IP as a `/32`*, discovered when the group is created. Entries may be CIDR blocks or bare
+addresses (a bare address means `/32`), IPv4 or IPv6 (v6 goes in `Ipv6Ranges`), and
+`["0.0.0.0/0"]` is honoured verbatim when somebody asks for it — with a warning line naming the
+group, so an intentional choice is still visible in the log.
+
+**Discovery is not a hard dependency, and there is no wide fallback.** `discoverPublicIP` GETs
+`https://checkip.amazonaws.com` (AWS's own service, plain-text body, 5s timeout, 64-byte read
+cap) — no new module dependency and no new vendor: anything that can reach EC2 can reach it.
+Verified live from this box: `3.106.139.163` in 0.51s. If it fails, `rig up` **fails** with
+`aws: cannot work out your public IP to authorise ssh (<why>); set providers.aws.ssh_cidrs to
+the block ssh may come from — ["1.2.3.4/32"] for one address, or ["0.0.0.0/0"] to accept the
+whole internet`. Argument for erroring rather than a narrower automatic fallback: there is no
+honest narrower default — rig cannot guess an operator's network, and any invented block
+(RFC1918, the last-known address) would either strand the user or authorise strangers. The
+failure is also nearly impossible in practice (EC2 unreachable means the launch dies anyway), it
+is one config line to fix permanently, and it happens *before* `CreateSecurityGroup`, so a
+failed launch leaves nothing behind AWS-side.
+
+**Changed operator address: rig adds the rule to its own group.** On reuse, `ensureSSHIngress`
+reads the group's existing 22/tcp ranges (`tcp` or `-1`, port 22 inside the range; rules
+referencing other groups or prefix lists are ignored — rig cannot tell whether they admit you)
+and adds only the wanted blocks that no existing block *covers* (a `/24` or `0.0.0.0/0` already
+containing the address counts as admitted, so nothing is added). It authorises only when the
+group carries `rig:managed=true`, logs one line naming the group and the block it added, and
+never revokes anything (the line says how to prune stale `/32`s). Chosen over telling the user
+to run the CLI because the changed-IP case is the everyday one (home ISP, café, VPN), the group
+is rig's own and holds only rig instances, so making the operator authorise their own address on
+rig's own group is friction with no safety gained. A group **without** the tag is never
+modified: if it does not admit the operator the launch is refused before `RunInstances`, naming
+the group id, the missing block, the missing tag and the exact
+`aws ec2 authorize-security-group-ingress --region … --group-id … --protocol tcp --port 22
+--cidr …` line (plus "point providers.aws.security_group at a group rig manages"). Either way
+`rig up` cannot silently produce an unreachable instance. One extra safety net for the group
+that already exists in the live account: when a rig-managed group still holds a
+`0.0.0.0/0` rule and config did not ask for one, rig warns with the
+`revoke-security-group-ingress` line rather than revoking it (a colleague may be relying on it).
+
+**Provenance for an auditor.** Description (immutable after creation, and validated live with
+`aws ec2 create-security-group --dry-run`, which answered "Request would have succeeded"):
+`rig: ssh (22/tcp) to rig-managed instances, from the operator address rig authorised. Created
+by rig (github.com/dtuit/rig); safe to delete when no rig instances remain.` Tags: `Name=rig`,
+`rig:managed=true`, and new `rig:purpose=ssh ingress for rig-managed instances`. Each authorised
+range carries the rule description `rig ssh`.
+
+**Tests** (all through `CreateInstance` with the existing fakes; `newTestDriverConfig` now stubs
+`publicIP` so no test can touch the network): `TestSecurityGroupAdmitsOnlyTheOperatorIP`
+(one `/32`, 22/tcp, description and tags), `TestConfiguredSSHCIDRsAreHonouredVerbatim`
+(`10.20.0.0/16`, `0.0.0.0/0`, bare `198.51.100.9` → `/32`, and discovery is never called),
+`TestExistingRigGroupGainsTheCurrentIP` (adds one `/32` to `sg-0old`, creates no second group,
+logs it, launches into it), `TestExistingRigGroupAlreadyAdmittingTheIPIsUntouched` (a covering
+`/24` → no authorize, no log), `TestRigGroupOpenToTheWorldIsFlagged` (no authorize, one warning
+naming `0.0.0.0/0` and the revoke line), `TestUnmanagedSecurityGroupIsNeverModified` (error names
+group/block/tag/CLI, nothing authorised or created, no `RunInstances`; and an unmanaged group
+that *does* admit you launches with nothing changed), `TestUndiscoverablePublicIPFailsNamingTheConfigKey`
+(error names `providers.aws.ssh_cidrs` and `0.0.0.0/0`; no group, no launch).
+
+**One existing test changed in intent, deliberately:**
+`TestCreateInstanceRequestShapeAndNetworkOnFirstUse` asserted the authorised CIDR was
+`0.0.0.0/0` and now asserts `203.0.113.7/32` (the stubbed discovery address, TEST-NET-3).
+`fakeEC2` gained `authorizeCalls` (every call in order; `authorized` still holds the last).
+
+**Docs.** `internal/cli/inventory.go`'s `exampleConfig` gained `ssh_cidrs`, `vpc`, `subnets` (and
+`security_group`'s comment now says "launch VPC"). `README.md`: the `aws:` config block gained
+the three keys, plus two new paragraphs before "Per-provider caveats" — "Who may ssh in on AWS"
+(the /32 default, the key, the changed-address behaviour, never touching a group rig did not
+create, nothing is ever revoked) and "rig will not invent a VPC" (no default VPC → pin
+`vpc`/`subnets`; rig creates no VPC, subnet, gateway or route; pin a *dedicated* VPC, not a
+production one, because that is where the ssh port lands). "What has been run for real" now
+records AWS EC2 as live-verified on 2026-09-08 (`t3.medium` with an EBS data volume,
+`g4dn.xlarge` on the DLAMI; spot and a firing deadline still unexercised); Vast's status is
+untouched.
+
+`go build ./...`, `go vet ./internal/provider/aws/ ./internal/cli/`, `go test ./...` and
+`gofmt -l ./internal ./cmd` all clean. AWS-side: only read-only calls plus one
+`create-security-group --dry-run`; `describe-security-groups --filters tag:rig:managed=true`
+returns `[]`, so nothing rig-managed exists in the account.
+
+**Follow-ups this adds.** (e) `ssh_cidrs` is parsed at launch time, so a typo is reported by
+`rig up` rather than at config load — after core may already have created a data volume;
+validating in the `provider.Register` factory would move it earlier (needs a way to build a
+`config.ProviderConfig` in a test). (f) Stale `/32`s accumulate in the group; rig deliberately
+never revokes, so a `rig doctor`-style prune is the natural home. (g) Split-tunnel VPNs make the
+discovered address the wrong one — the symptom is an ssh timeout and the fix is `ssh_cidrs`;
+worth a line in the timeout message if it ever bites. (h) Discovery happens once per process per
+zone; a long-running `rig up --watch` that outlives an IP change is not reconciled.

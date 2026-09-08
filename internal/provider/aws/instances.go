@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -96,6 +97,7 @@ func (d *Driver) fromEC2Instances(ctx context.Context, raw []types.Instance) []p
 			spotNames = append(spotNames, v.Type)
 		}
 	}
+	d.learnGPUs(ctx, names)
 	prices := d.onDemandPrices(ctx, names)
 	var spot map[string]map[string]float64
 	if len(spotNames) > 0 {
@@ -117,6 +119,34 @@ func (d *Driver) fromEC2Instances(ctx context.Context, raw []types.Instance) []p
 		}
 	}
 	return out
+}
+
+// learnGPUs fills the type -> GPU name cache for the names it does not
+// know yet, so a listing reports the GPU even when InstanceTypes has not
+// run in this process (rig status never calls it). One
+// DescribeInstanceTypes call per process for the types in use; a failure
+// is not worth an error — the GPU field is decoration, so it stays empty.
+func (d *Driver) learnGPUs(ctx context.Context, names []string) {
+	d.mu.Lock()
+	var want []types.InstanceType
+	for _, n := range names {
+		if _, ok := d.gpuByType[n]; !ok {
+			want = append(want, types.InstanceType(n))
+		}
+	}
+	d.mu.Unlock()
+	if len(want) == 0 {
+		return
+	}
+	out, err := d.ec2.DescribeInstanceTypes(ctx, &ec2.DescribeInstanceTypesInput{InstanceTypes: want})
+	if err != nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, it := range out.InstanceTypes {
+		d.gpuByType[string(it.InstanceType)] = gpuName(it.GpuInfo)
+	}
 }
 
 // fromEC2Instance is the pure mapping; prices and GPU are filled by the
@@ -231,15 +261,39 @@ func (d *Driver) describeRootDevice(ctx context.Context, ami string) (string, er
 	return "", nil
 }
 
-// network is what a launch in one zone needs: the default VPC's subnet
-// there and the rig security group's id.
+// launchVPC is the VPC a launch goes into: config's VPC when set, the
+// region's default VPC otherwise. It returns "" without error when only
+// Subnets is configured — the chosen subnet names its own VPC.
+func (d *Driver) launchVPC(ctx context.Context) (string, error) {
+	if d.cfg.VPC != "" {
+		return d.cfg.VPC, nil
+	}
+	if len(d.cfg.Subnets) > 0 {
+		return "", nil
+	}
+	vpcs, err := d.ec2.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{Filters: []types.Filter{filter("is-default", "true")}})
+	if err != nil {
+		return "", d.fail("finding the default VPC", err)
+	}
+	for _, v := range vpcs.Vpcs {
+		if sdk.ToBool(v.IsDefault) {
+			return deref(v.VpcId), nil
+		}
+	}
+	return "", fmt.Errorf("aws: no default VPC in %s; create one with: aws ec2 create-default-vpc --region %s, or point rig at an existing network with providers.aws.vpc (or providers.aws.subnets) in the config", d.region, d.region)
+}
+
+// network is what a launch in one zone needs: the subnet there and the rig
+// security group's id.
 type network struct {
 	subnet, group string
 }
 
-// ensureNetwork finds the default VPC, its subnet in zone and the security
-// group named in config, creating the group (22/tcp from anywhere, tagged
-// rig:managed) when it does not exist. Answers are kept for the process.
+// ensureNetwork finds the subnet to launch in for zone and the security
+// group named in config, creating the group when it does not exist (see
+// ensureSSHIngress for what it admits). The subnet comes from config's
+// Subnets when set, else from config's VPC, else from the region's default
+// VPC. Answers are kept for the process.
 func (d *Driver) ensureNetwork(ctx context.Context, zone string) (network, error) {
 	d.mu.Lock()
 	n, ok := d.network[zone]
@@ -248,76 +302,61 @@ func (d *Driver) ensureNetwork(ctx context.Context, zone string) (network, error
 		return n, nil
 	}
 
-	vpcs, err := d.ec2.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{Filters: []types.Filter{filter("is-default", "true")}})
+	vpc, err := d.launchVPC(ctx)
 	if err != nil {
-		return network{}, d.fail("finding the default VPC", err)
-	}
-	vpc := ""
-	for _, v := range vpcs.Vpcs {
-		if sdk.ToBool(v.IsDefault) {
-			vpc = deref(v.VpcId)
-			break
-		}
-	}
-	if vpc == "" {
-		return network{}, fmt.Errorf("aws: no default VPC in %s; create one with: aws ec2 create-default-vpc --region %s", d.region, d.region)
+		return network{}, err
 	}
 
-	subs, err := d.ec2.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{
-		Filters: []types.Filter{filter("vpc-id", vpc), filter("availability-zone", zone)},
-	})
+	in := &ec2.DescribeSubnetsInput{}
+	if len(d.cfg.Subnets) > 0 {
+		in.SubnetIds = d.cfg.Subnets
+	} else {
+		in.Filters = []types.Filter{filter("vpc-id", vpc), filter("availability-zone", zone)}
+	}
+	subs, err := d.ec2.DescribeSubnets(ctx, in)
 	if err != nil {
 		return network{}, d.fail("finding a subnet in "+zone, err)
 	}
+	best := -1
 	for _, s := range subs.Subnets {
 		if deref(s.AvailabilityZone) != zone {
 			continue
 		}
-		if n.subnet == "" || sdk.ToBool(s.DefaultForAz) {
-			n.subnet = deref(s.SubnetId)
+		if len(d.cfg.Subnets) > 0 && !slices.Contains(d.cfg.Subnets, deref(s.SubnetId)) {
+			continue
+		}
+		if vpc != "" && deref(s.VpcId) != "" && deref(s.VpcId) != vpc {
+			continue
+		}
+		// Prefer the zone's default subnet, then one that assigns public
+		// IPs: the launch always asks for a public IP and rig dials it.
+		score := 0
+		if sdk.ToBool(s.DefaultForAz) {
+			score += 2
+		}
+		if sdk.ToBool(s.MapPublicIpOnLaunch) {
+			score++
+		}
+		if score > best {
+			best, n.subnet = score, deref(s.SubnetId)
+			if vpc == "" {
+				vpc = deref(s.VpcId)
+			}
 		}
 	}
 	if n.subnet == "" {
-		return network{}, fmt.Errorf("aws: no subnet in %s in the default VPC %s", zone, vpc)
+		if len(d.cfg.Subnets) > 0 {
+			return network{}, fmt.Errorf("aws: none of the configured providers.aws.subnets is in %s; list a subnet per zone rig should use, or pin one with --location", zone)
+		}
+		return network{}, fmt.Errorf("aws: no subnet in %s in VPC %s", zone, vpc)
+	}
+	if vpc == "" {
+		return network{}, fmt.Errorf("aws: subnet %s does not name its VPC", n.subnet)
 	}
 
-	groups, err := d.ec2.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
-		Filters: []types.Filter{filter("vpc-id", vpc), filter("group-name", d.cfg.SecurityGroup)},
-	})
+	n.group, err = d.ensureSSHIngress(ctx, vpc)
 	if err != nil {
-		return network{}, d.fail("finding security group "+d.cfg.SecurityGroup, err)
-	}
-	for _, g := range groups.SecurityGroups {
-		if deref(g.GroupName) == d.cfg.SecurityGroup {
-			n.group = deref(g.GroupId)
-		}
-	}
-	if n.group == "" {
-		created, err := d.ec2.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{
-			GroupName:   sdk.String(d.cfg.SecurityGroup),
-			Description: sdk.String("rig: ssh access to rig-managed instances"),
-			VpcId:       sdk.String(vpc),
-			TagSpecifications: []types.TagSpecification{{
-				ResourceType: types.ResourceTypeSecurityGroup,
-				Tags:         managedTags(d.cfg.SecurityGroup),
-			}},
-		})
-		if err != nil {
-			return network{}, d.fail("creating security group "+d.cfg.SecurityGroup, err)
-		}
-		n.group = deref(created.GroupId)
-		_, err = d.ec2.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
-			GroupId: sdk.String(n.group),
-			IpPermissions: []types.IpPermission{{
-				IpProtocol: sdk.String("tcp"),
-				FromPort:   sdk.Int32(22),
-				ToPort:     sdk.Int32(22),
-				IpRanges:   []types.IpRange{{CidrIp: sdk.String("0.0.0.0/0"), Description: sdk.String("rig ssh")}},
-			}},
-		})
-		if err != nil {
-			return network{}, d.fail("opening ssh on security group "+d.cfg.SecurityGroup, err)
-		}
+		return network{}, err
 	}
 
 	d.mu.Lock()
@@ -456,7 +495,7 @@ func (d *Driver) CreateInstance(ctx context.Context, req provider.CreateInstance
 		}},
 		TagSpecifications: []types.TagSpecification{
 			{ResourceType: types.ResourceTypeInstance, Tags: append(managedTags(req.Name), tag("rig:image", req.Image))},
-			{ResourceType: types.ResourceTypeVolume, Tags: managedTags(req.Name)},
+			{ResourceType: types.ResourceTypeVolume, Tags: append(managedTags(req.Name), tag(osVolumeTag, "true"))},
 		},
 	}
 	if req.OSVolumeGB > 0 {

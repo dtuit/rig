@@ -259,7 +259,10 @@ providers:                             # per-provider blocks; env vars always wi
   aws:
     profile: default                       # SDK credential chain; AWS_PROFILE also honoured
     region: ap-southeast-2                 # one region per block
-    security_group: rig                    # created in the default VPC, opens 22/tcp
+    security_group: rig                    # created in the launch VPC, opens 22/tcp
+    ssh_cidrs: []                          # empty = only your current public IP, as a /32
+    vpc: ""                                # launch VPC; empty needs a default VPC in the region
+    subnets: []                            # explicit subnet ids, at most one per zone
     default_image: ""                      # SSM parameter path (/aws/...) or ami-xxxx
     volume_type: gp3                       # EBS type for data volumes
     families: [g6, g6e, p5]                # instance families rig types lists

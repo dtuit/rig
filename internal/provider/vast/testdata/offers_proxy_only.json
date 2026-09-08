@@ -1,0 +1,26 @@
+{
+  "offers": [
+    {
+      "id": 50103181,
+      "machine_id": 149918,
+      "gpu_name": "RTX PRO 4000",
+      "num_gpus": 1,
+      "gpu_ram": 24467,
+      "cpu_ram": 64365,
+      "cpu_cores_effective": 16.0,
+      "dph_total": 0.17703703703703705,
+      "dph_base": 0.17333333333333334,
+      "min_bid": 0.17333333333333334,
+      "geolocation": "Alberta, CA",
+      "reliability2": 0.9625289,
+      "rentable": true,
+      "rented": false,
+      "verified": null,
+      "external": null,
+      "direct_port_count": 0,
+      "cuda_max_good": 13.0,
+      "disk_space": 805.95,
+      "is_bid": false
+    }
+  ]
+}

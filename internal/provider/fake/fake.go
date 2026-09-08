@@ -199,6 +199,11 @@ func (p *Provider) StartInstance(_ context.Context, id string) error {
 	return p.setStatus(id, provider.Running)
 }
 
+// SetStatus makes id report s from now on, in listings as well as gets —
+// for a status no rig command produces, such as an instance the cloud has
+// already discarded (provider.Gone).
+func (p *Provider) SetStatus(id string, s provider.Status) error { return p.setStatus(id, s) }
+
 func (p *Provider) setStatus(id string, s provider.Status) error {
 	in, ok := p.instances[id]
 	if !ok {

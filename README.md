@@ -39,7 +39,10 @@ providers:                               # per-provider blocks; env vars always 
     min_reliability: 0.95                  # also bid_markup, direct_only, image, disk_gb, filters
   aws:
     profile: default                       # SDK credential chain; AWS_PROFILE honoured
-    region: ap-southeast-2                 # also security_group, default_image, volume_type
+    region: ap-southeast-2                 # one region per block
+    ssh_cidrs: []                          # who may ssh in; empty = your current public IP, /32
+    vpc: vpc-0123456789abcdef0             # needed when the account has no default VPC
+    subnets: [subnet-0aaa, subnet-0bbb]    # one per zone rig may use; imply their VPC
 ssh:
   user: root                             # optional override of the provider's login user
   public_key: ~/.ssh/id_ed25519.pub      # registered with the provider on first up
@@ -66,6 +69,30 @@ it, so `aws sso login --profile <name>` is the whole story. Get the keys from
 the Verda console (*Keys → REST API Credentials*), RunPod (*Settings → API
 Keys*) and Vast (*Account → API keys*).
 
+**Who may ssh in on AWS.** The `rig` security group rig creates allows 22/tcp
+from your current public IP only — discovered from `checkip.amazonaws.com` when
+the group is created, and written as a `/32`. Set `ssh_cidrs` to pin it
+yourself (`[10.20.0.0/16]`, a bare address means `/32`, and `[0.0.0.0/0]` is
+honoured if you really want the whole internet); with `ssh_cidrs` empty and no
+way to determine your address, `rig up` fails and tells you to set the key
+rather than opening the port to everybody. Your address changing is expected:
+rig adds the new `/32` to its own group — the one tagged `rig:managed=true` —
+and says so. It never edits a group it did not create; if you point
+`security_group` at your own group and that group does not admit you, `rig up`
+refuses with the `authorize-security-group-ingress` line to run. Nothing is
+ever revoked, so prune stale `/32`s yourself, and rig will warn you if its
+group still stands open to `0.0.0.0/0` from an earlier release.
+
+**rig will not invent a VPC.** AWS launches go into the region's default VPC
+and the chosen zone's subnet, with a public IP. An account that never had a
+default VPC, or had it deleted for compliance, must pin `providers.aws.vpc`
+(rig then picks a public subnet in the launch zone) or `providers.aws.subnets`
+(explicit ids, at most one per zone; a zone none of them covers is an error,
+not a launch somewhere else). rig creates no VPC, subnet, gateway or route of
+its own. Pin a **dedicated** VPC rather than a production one: rig creates its
+security group wherever you point it, and an internet-facing ssh port does not
+belong in a production network.
+
 ### Per-provider caveats
 
 |                | Verda | RunPod | Vast.ai | AWS EC2 |
@@ -81,11 +108,15 @@ Keys*) and Vast (*Account → API keys*).
 **What has been run for real.** Verda is the cloud rig has driven since its
 first commit, and its columns rest on that use plus the tests around it.
 RunPod was smoke-tested end to end on 2026-09-08 — up, ssh, a job, the
-pod-scoped self-stop, down. The Vast.ai and AWS EC2 columns describe drivers
-that are written and unit-tested against recorded API responses but have
-never talked to the live cloud (no billing method on the Vast account, an
-expired AWS SSO token), so read those two as what rig intends to do, not as
-observed behaviour.
+pod-scoped self-stop, down. AWS EC2 was live-verified the same day, on
+`t3.medium` (with an EBS data volume created, mounted, kept across `down` and
+deleted on request) and on `g4dn.xlarge` (the Deep Learning AMI, Tesla T4):
+up, ssh, a job, `sync`, a tunnel, live prices, the watchdog under systemd,
+down. Spot launches and a deadline actually firing are the AWS parts still
+unexercised. The Vast.ai column describes a driver that is written and
+unit-tested against recorded API responses but has never talked to the live
+cloud (no billing method on the account), so read that one as what rig intends
+to do, not as observed behaviour.
 
 Marketplace type tokens are `<count>x<GPU name with spaces as dashes>`, and
 matching is case-insensitive, so `--type 1xrtx-4090` finds the same offers as

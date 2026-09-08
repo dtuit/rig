@@ -86,9 +86,7 @@ func (d *Driver) InstanceTypes(ctx context.Context) ([]provider.InstanceType, er
 			SpotPrice:    minSpot(spot[name]),
 		}
 		if g := it.GpuInfo; g != nil {
-			if len(g.Gpus) > 0 {
-				t.GPU = strings.TrimSpace(deref(g.Gpus[0].Manufacturer) + " " + deref(g.Gpus[0].Name))
-			}
+			t.GPU = gpuName(g)
 			for _, gpu := range g.Gpus {
 				t.GPUCount += int(sdk.ToInt32(gpu.Count))
 			}
@@ -104,6 +102,15 @@ func (d *Driver) InstanceTypes(ctx context.Context) ([]provider.InstanceType, er
 		out = append(out, t)
 	}
 	return out, nil
+}
+
+// gpuName is the display name of an instance type's first GPU device
+// ("NVIDIA A10G"); empty for a type with no accelerator.
+func gpuName(g *types.GpuInfo) string {
+	if g == nil || len(g.Gpus) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(deref(g.Gpus[0].Manufacturer) + " " + deref(g.Gpus[0].Name))
 }
 
 // Availability is zone -> instance types offered there. Offered is not

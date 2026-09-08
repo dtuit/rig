@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -203,6 +204,20 @@ func matches(o, q map[string]any) bool {
 		for op, want := range ops {
 			hn, hok := have.(float64)
 			wn, wok := want.(float64)
+			// Measured live 2026-09-08: a geolocation clause matches the
+			// host's upper-case country code ("KR"), never the spelled-out
+			// string the response carries ("South Korea, KR") and never a
+			// lower-case code.
+			if field == "geolocation" {
+				code := ""
+				if s := fmt.Sprint(have); strings.Contains(s, ",") {
+					code = strings.TrimSpace(s[strings.LastIndex(s, ",")+1:])
+				}
+				if op == "eq" && fmt.Sprint(want) != code {
+					return false
+				}
+				continue
+			}
 			switch op {
 			case "eq":
 				if fmt.Sprint(have) != fmt.Sprint(want) {
@@ -258,10 +273,17 @@ func TestCapabilities(t *testing.T) {
 	if !caps.Spot || caps.Volumes || !caps.Balance || !caps.DockerImages {
 		t.Errorf("Capabilities = %+v, want spot, balance and docker images, no volumes", caps)
 	}
-	for _, want := range []string{"/etc/environment", "$CONTAINER_ID", "$CONTAINER_API_KEY", `{"state":"stopped"}`} {
+	for _, want := range []string{procEnviron, "CONTAINER_ID=", "CONTAINER_API_KEY=", `{"state":"stopped"}`} {
 		if !strings.Contains(caps.SelfStop, want) {
 			t.Errorf("SelfStop lacks %q: %s", want, caps.SelfStop)
 		}
+	}
+	// Live 2026-09-08: /etc/environment on a Vast container holds only the
+	// image's build-time env — neither variable is in it — and its unquoted
+	// values (`NVIDIA_REQUIRE_CUDA=cuda>=12.8 brand=unknown`) make sourcing
+	// it fail outright. Reading it must not come back.
+	if strings.Contains(caps.SelfStop, "/etc/environment") {
+		t.Errorf("SelfStop reads /etc/environment, which carries neither variable: %s", caps.SelfStop)
 	}
 	if d.Name() != "vast" {
 		t.Errorf("Name = %q", d.Name())
@@ -633,6 +655,37 @@ func TestCreateInstancePinsLocationAndDefaults(t *testing.T) {
 	}
 }
 
+// A location pin is exact within its country. Vast's offer filter only
+// understands the country code, so three US offers come back for a US pin
+// and the driver must rent the one whose geolocation the user asked for —
+// not the cheapest of the country (regression: live smoke 2026-09-08, where
+// pinning "South Korea, KR" matched no offer at all and every rig up on
+// Vast failed with ErrNoCapacity).
+func TestCreateInstanceLocationPinIsExactWithinCountry(t *testing.T) {
+	for _, tc := range []struct {
+		pin  string
+		want int64
+	}{
+		{"United States, US", 50243756}, // cheapest of the three US offers
+		{"Delaware, US", 45786457},      // dearer, but the one pinned
+		{", US", 40912235},              // a host with no region: dearest of the three
+		{"us", 50243756},                // a bare country code takes the country's cheapest
+	} {
+		f := newFake(t)
+		p := newTestDriver(t, f, Config{})
+		in, err := p.CreateInstance(t.Context(), provider.CreateInstanceRequest{Type: "1xRTX-4090", Name: "rig-loc", Location: tc.pin})
+		if err != nil {
+			t.Fatalf("pin %q: %v", tc.pin, err)
+		}
+		if len(f.asks) != 1 || f.asks[0]["_id"] != tc.want {
+			t.Errorf("pin %q rented %v, want offer %d only", tc.pin, f.asks, tc.want)
+		}
+		if tc.pin != "us" && in.Location != tc.pin {
+			t.Errorf("pin %q → instance location %q", tc.pin, in.Location)
+		}
+	}
+}
+
 // A bid rents from the bid market at min_bid × bid_markup.
 func TestCreateInstanceBidPrice(t *testing.T) {
 	f := newFake(t)
@@ -729,11 +782,14 @@ func TestVolumesUnsupported(t *testing.T) {
 	}
 }
 
-func TestBalance(t *testing.T) {
+// A renter's spendable money is `credit`; `balance` is 0 on a funded
+// account (live 2026-09-08: $10 of credit read back as balance 0, which the
+// dashboard showed as $0.00), so the fixture is that live shape.
+func TestBalanceIsTheAccountCredit(t *testing.T) {
 	p := newTestDriver(t, newFake(t), Config{})
 	amount, cur, err := p.Balance(t.Context())
-	if err != nil || amount != 7.5 || cur != "USD" {
-		t.Errorf("Balance = %v %s %v, want 7.5 USD", amount, cur, err)
+	if err != nil || amount != 9.99419829187 || cur != "USD" {
+		t.Errorf("Balance = %v %s %v, want 9.99419829187 USD (the credit, not the balance)", amount, cur, err)
 	}
 }
 
@@ -760,8 +816,8 @@ func TestRateLimitRetry(t *testing.T) {
 	f := newFake(t)
 	f.rateLimit = 3
 	p := newTestDriver(t, f, Config{})
-	if amount, _, err := p.Balance(t.Context()); err != nil || amount != 7.5 {
-		t.Errorf("after 3 × 429: %v %v, want 7.5", amount, err)
+	if amount, _, err := p.Balance(t.Context()); err != nil || amount != 9.99419829187 {
+		t.Errorf("after 3 × 429: %v %v, want the fixture's credit", amount, err)
 	}
 	f.rateLimit = 4
 	_, _, err := p.Balance(t.Context())
@@ -779,5 +835,128 @@ func TestBadKeyIsClearError(t *testing.T) {
 	_, err := d.ListInstances(t.Context())
 	if err == nil || !strings.Contains(err.Error(), "401") || !strings.Contains(err.Error(), "Invalid API key") {
 		t.Errorf("err = %v, want HTTP 401 with Vast's message", err)
+	}
+}
+
+// The stop line is rig's whole cost-safety story on Vast, so it is proved
+// by running it: rendered against a fake PID-1 environment and a fake curl
+// on PATH, it must PUT {"state":"stopped"} to this container's own id with
+// the instance-scoped key, and it must survive the hostile values a
+// container environment carries (an unquoted `cuda>=12.8 brand=unknown`
+// would redirect if the environment were sourced instead of parsed).
+// Measured live 2026-09-08 on instance 50300289.
+func TestSelfStopLineStopsThisContainer(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("no bash on PATH")
+	}
+	const wantKey = "instance-scoped-key"
+	dir := t.TempDir()
+	environ := filepath.Join(dir, "environ")
+	entries := []string{
+		"NVIDIA_REQUIRE_CUDA=cuda>=12.8 brand=unknown",
+		"CONTAINER_ID=50300289",
+		"CONTAINER_API_KEY=" + wantKey,
+		"CONTAINER_LABEL=C.50300289",
+	}
+	if err := os.WriteFile(environ, []byte(strings.Join(entries, "\x00")+"\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keyFile := filepath.Join(dir, "vast_api_key")
+	labelFile := filepath.Join(dir, "vast_containerlabel")
+	if err := os.WriteFile(keyFile, []byte("fallback-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(labelFile, []byte("C.50300289\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// a curl that records its arguments instead of calling Vast
+	bin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	log := filepath.Join(dir, "curl.args")
+	script := "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > " + log + "\n"
+	if err := os.WriteFile(filepath.Join(bin, "curl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(name, line string) string {
+		t.Helper()
+		if err := os.Remove(log); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("bash", "-c", "set -u\n"+line)
+		cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: running the stop line: %v: %s", name, err, out)
+		}
+		if len(out) > 0 {
+			t.Errorf("%s: the stop line wrote %q; it must be quiet until curl speaks", name, out)
+		}
+		b, err := os.ReadFile(log)
+		if err != nil {
+			t.Fatalf("%s: the stop line did not call curl: %v", name, err)
+		}
+		return string(b)
+	}
+
+	args := run("pid 1", renderSelfStop(environ, keyFile, labelFile))
+	for _, want := range []string{
+		"https://console.vast.ai/api/v0/instances/50300289/",
+		"Authorization: Bearer " + wantKey,
+		`{"state":"stopped"}`,
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("curl args lack %q:\n%s", want, args)
+		}
+	}
+
+	// With PID 1's environment unreadable, Vast's own files answer instead.
+	args = run("fallback", renderSelfStop(filepath.Join(dir, "gone"), keyFile, labelFile))
+	for _, want := range []string{"instances/50300289/", "Bearer fallback-key"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("fallback curl args lack %q:\n%s", want, args)
+		}
+	}
+}
+
+// A host with no direct ports serves ssh through Vast's proxy alone, and
+// asking such a host for a port mapping makes the rental un-creatable:
+// live 2026-09-08, renting offer 50103181 with env {"-p 22:22": "1"} left
+// the instance in loading for ever with status_msg `docker: invalid
+// hostPort: -1`. The port request must reach only hosts that have ports.
+func TestCreateInstanceAsksForAPortOnlyWhereTheHostHasOne(t *testing.T) {
+	f := newFake(t)
+	f.addOffers("on-demand", "offers_proxy_only.json")
+	p := newTestDriver(t, f, Config{})
+
+	if _, err := p.CreateInstance(t.Context(), provider.CreateInstanceRequest{Type: "1xRTX-PRO-4000", Name: "rig-proxy", Location: "Alberta, CA"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.asks) != 1 || f.asks[0]["_id"] != int64(50103181) {
+		t.Fatalf("asks = %v, want the proxy-only offer", f.asks)
+	}
+	if env, ok := f.asks[0]["env"]; ok {
+		t.Errorf("proxy-only host asked for env %v, want no port request at all", env)
+	}
+	// Direct ssh must not even be asked for: it is the runtype that makes
+	// docker map the port, so "ssh_direc ssh_proxy" fails on this host the
+	// same way (measured live 2026-09-08, twice). Proxy ssh alone works.
+	if rt, _ := f.asks[0]["runtype"].(string); rt != "ssh_proxy" {
+		t.Errorf("runtype = %q, want ssh_proxy alone on a host with no ports", rt)
+	}
+
+	f.asks = nil
+	if _, err := p.CreateInstance(t.Context(), provider.CreateInstanceRequest{Type: "1xRTX-4090", Name: "rig-direct", Location: "Delaware, US"}); err != nil {
+		t.Fatal(err)
+	}
+	env, _ := f.asks[0]["env"].(map[string]any)
+	if env["-p 22:22"] != "1" {
+		t.Errorf("host with 12 direct ports asked for env %v, want the sshd port mapped", f.asks[0]["env"])
+	}
+	if rt, _ := f.asks[0]["runtype"].(string); rt != "ssh_direc ssh_proxy" {
+		t.Errorf("runtype = %q, want direct ssh with the proxy as fallback", rt)
 	}
 }

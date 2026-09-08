@@ -46,7 +46,7 @@ Bids (`spot: true`) work with a markup over `min_bid`. Volumes are refused with 
       -d '{"state":"stopped"}'`.
 - [x] Tests: fixtures for offers/instances/user; token grouping; direct-vs-proxy endpoint;
       offer-taken retry; bid price maths.
-- [ ] Manual smoke (after funding + billing method): as in 06, plus a `spot: true` run and a
+- [x] Manual smoke (after funding + billing method): as in 06, plus a `spot: true` run and a
       proxy-only host.
 
 ## Notes
@@ -152,3 +152,107 @@ aborting rather than walking every offer when a create fails for a non-offer-gon
 Follow-up for the TUI owner: `internal/tui/picker.go` clips `Description` to 14 columns, so
 `"2 offers (bid only)"` renders as `"2 offers (bid…"`; `rig types` does not print `Description` at
 all, so a bid-only row shows its price with `AVAILABLE` `-` unless `--spot` is passed.
+
+2026-09-08 (agent, live smoke): **First live run against Vast** ($10 credit, never rented, no ssh
+key registered). Isolated config (`RIG_CONFIG` in a scratch dir, `credentials_file`
+`~/secrets/vast.env`, `ssh.public_key ~/.ssh/rig_ed25519.pub`, `defaults.ttl 30m`,
+`direct_only: true`), binary built to the same scratch dir. Three instances rented and destroyed;
+total spend **$0.0085** (credit 10.00 → 9.99147), ~35 min. **Four live bugs found and fixed, each
+red → green against the httptest fake.**
+
+**Sequence and results.** `rig types --available`: 8 s, 214 shapes grouped by geolocation, prices
+sane (cheapest 1xQuadro-P2000 $0.03), no `$0.00` in `$/H`. `rig up --type 1xRTX-2070 --location
+"South Korea, KR" --name smoke --ttl 30m`: **failed at first** (bug 1), then succeeded in **48 s**
+(offer 49868123, $0.0589/h, id 50300289) — `EnsureSSHKey` registered the account's first key
+(`POST /ssh/` → id 1336033) on the way. `rig status` / `--json`: endpoint `1.208.108.242:39013`
+(direct, host-mapped port), provider `vast`, `raw_status` running. `rig ssh -- …`: no
+`/run/systemd/system`, `~/.rig/ttl.pid` = 378 naming a live `bash /root/.rig/ttl.sh`, tmux 3.4 and
+rsync 3.2.7 already in the image (`ensureTools` installed nothing), `~/.no_auto_tmux` and
+`~/.rig/onstart.sh` in place, `env | grep -c CONTAINER_ID` = **0** (so an ssh session really does
+not inherit the pair). `rig run --name hello --wait`: exit 0, `rig logs hello` printed the hostname
+and `NVIDIA GeForce RTX 2070`, `rig ps` showed `exited 0`. `rig sync <dir>`: file arrived. `rig
+extend 1h`: deadline moved. `rig tunnel --detach 8000` → `tunnel status` `connected` → `curl
+localhost:8000` **HTTP 200** → `rig tunnel stop`. `rig adopt` mid-run reinstalled the footprint and
+restarted the watchdog without duplicating it (pid 378 → 475).
+
+**Self-stop: verified end to end.** With no rig-\* tmux session alive, `echo $(($(date +%s)-10)) >
+~/.rig/deadline` at 18:42:51; the watchdog's next tick ran the stop line; the API showed
+`intended_status: stopped` at **18:43:57** and `actual_status: exited` at **18:44:17** — the
+container stopped itself with its own instance-scoped credentials, no account key involved
+(ADR-0003 holds). `~/.rig/ttl.log` stayed empty (curl said nothing on success). This only worked
+after bug 2 was fixed; the original line could never have worked.
+
+**Bug 1 — a location pin matched no offer, so every `rig up` failed.** `Availability`/`Locations`
+report `geolocation` as the API spells it ("South Korea, KR") and `CreateInstance` sent that back as
+`geolocation eq`, but the offer filter only understands the **upper-case two-letter country code**:
+`eq "South Korea, KR"` → 0 offers, `eq "kr"` → 0, `eq "KR"` → 1. Since `core.Pick` always pins a
+location, `rig up` on Vast could never rent anything ("no capacity for … trying next" → `none of
+1xRTX-2070 available on-demand`). Fixed in `offers.go`/`instances.go`: `countryCode()` narrows the
+search to the country and `matchesLocation()` then matches the pin exactly client-side, so a pin
+never rents a cheaper host elsewhere in the same country (a bare `US` still takes the country's
+cheapest). `searchAll` gained a `base` clause argument and create now pages through it, because one
+search page is capped at 512. Tests: the fake's `matches()` now models the country-code semantics
+(that alone turned three existing tests red, reproducing the live failure), plus
+`TestCreateInstanceLocationPinIsExactWithinCountry` over the three US 1xRTX-4090 fixtures
+(`United States, US` → 50243756, `Delaware, US` → 45786457, `, US` → 40912235, `us` → cheapest).
+
+**Bug 2 — the self-stop line read the wrong file and could not have stopped anything.** It sourced
+`/etc/environment`, which on a Vast container holds only the **image's build-time env** — neither
+`CONTAINER_ID` nor `CONTAINER_API_KEY` is in it — and cannot even be sourced: its values are
+unquoted, so `. /etc/environment` died on `NVIDIA_REQUIRE_CUDA=cuda>=12.8 brand=unknown` with
+`line 12: 471: No such file or directory` and left `$CONTAINER_ID` empty. The pair lives in the
+environment of **PID 1** (`bash /.launch`, Vast's own launcher), and Vast also drops
+`/root/.vast_api_key` (verified byte-identical to the injected `CONTAINER_API_KEY`, 64 chars — the
+instance-scoped key, not the account's) and `/root/.vast_containerlabel` (`C.<id>`). `selfStop` is
+now built by `renderSelfStop(procEnviron, containerKeyFile, containerLabelFile)`, reading
+`/proc/1/environ` and falling back to those two files. The paths are arguments so
+`TestSelfStopLineStopsThisContainer` **runs the real line** under bash against a fixture environ
+(including a hostile `cuda>=12.8 brand=unknown` entry) with a fake `curl` on PATH, asserting the PUT
+URL, the bearer token and `{"state":"stopped"}` — and the same for the fallback branch.
+`TestCapabilities` now forbids `/etc/environment` (the one existing assertion changed).
+
+**Bug 3 — a proxy-only host could never be rented (two live failures).** On an offer with
+`direct_port_count: 0` the rental sat in `loading` for ever with `status_msg` `docker: invalid
+hostPort: -1`: both `env {"-p 22:22": "1"}` **and** the `ssh_direc` half of the runtype ask docker
+to map a host port the host does not have (dropping only the env still failed — measured). The
+driver now sends the port request and `"ssh_direc ssh_proxy"` only when `direct_port_count > 0`, and
+`"ssh_proxy"` alone otherwise (`runtypeFor`). New fixture `testdata/offers_proxy_only.json` (live
+offer 50103181, RTX PRO 4000, Alberta CA, 0 ports) and
+`TestCreateInstanceAsksForAPortOnlyWhereTheHostHasOne`. Verified live afterwards: `rig up --type
+1xRTX-PRO-4000 --location "Alberta, CA"` came up in **42 s** (id 50302915, $0.18/h), `rig status`
+endpoint `ssh8.vast.ai:22914` with `ip` still the public address, `rig run` returned `proxied from
+466c5e1da2d6`, watchdog live, `rig down --yes` deleted it. Reaching a proxy-only host needed
+`filters: {verified: {eq: false}, direct_port_count: {eq: 0}}` — **no verified offer today has
+fewer than 9 direct ports**, so the proxy path is otherwise unreachable with the driver's default
+`verified eq true`.
+
+**Bug 4 — `Balance` reported $0.00 on a funded account.** Live `GET /users/current/` answers
+`credit: 10.0, balance: 0` (a renter's money is `credit`; `balance` is a host's unpaid earnings), so
+the dashboard tile would have read $0.00 with $10 available. `Balance` now returns `credit`
+(deviation from this issue's checkbox, which says `balance`). `testdata/user.json` is the live shape
+(credit 9.99419829187, balance 0) and `TestBalanceIsTheAccountCredit` expects the credit;
+`TestRateLimitRetry`'s expected amount moved with the fixture.
+
+**Spot.** `rig up --spot --type 1xRTX-3060 --location "Ohio, US"` came up in 4 min (id 50301384):
+`is_bid: true`, bid placed at `min_bid 0.02666666666666667 × 1.2 = 0.032` exactly as the maths
+says, instance `dph_total` 0.03756 (bid + storage), footprint installed, destroyed cleanly.
+
+**Confirmed non-problems.** `disk_gb` default 20 is enough for the default image
+(`vastai/pytorch:cuda-12.8.1-auto`, 12.4 GB compressed) — Vast's disk allocation does not have to
+cover it; the instance reported `disk_space: 20.0` and worked. The default image ran on Turing
+(RTX 2070) and Ampere, so no image override was needed; a Pascal card was avoided deliberately, and
+note that an offer with `cuda_max_good < 12.8` will refuse this image (`NVIDIA_REQUIRE_CUDA
+cuda>=12.8`) — the recorded `filters: {cuda_max_good: {gte: 12.8}}` escape hatch is the answer.
+
+**Cleanup.** All three instances destroyed with `DELETE /instances/{id}/` (two through `rig down`,
+one directly after a failed create); `GET /instances/` returns `{"instances": []}`. Credit
+**10.00 → 9.99147** ($0.00853 spent). The registered ssh key (id 1336033) is **left in place** on
+purpose — `EnsureSSHKey` reuses it and Vast copies account keys into new instances.
+
+**Follow-ups (outside this issue's files).** (a) `rig down` with no `-i` refuses a self-stopped
+instance — `ResolveFresh("")` only auto-selects `provider.Running`, so the normal end state of a
+Vast/RunPod TTL expiry needs `rig down -i <name>`, while the stopped container keeps billing
+storage; core-side. (b) `core.provision` logs only "no capacity for X in Y, trying next" and drops
+the driver's reason, which is what made bug 1 hard to see; core-side. (c) `rig types` prints
+`SPOT$/H 0.00` for a shape with no bid offers (`SpotPrice` 0) — cli-side. (d) `rig up`'s "instance
+running at <ip>" prints the public address even when the endpoint is the proxy host; cosmetic.

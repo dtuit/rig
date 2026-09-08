@@ -222,9 +222,11 @@ func TestProvisionWalksCandidatesOnNoCapacityAtCreate(t *testing.T) {
 			t.Errorf("attempt %d = %v, want %v", i, got[i], want[i])
 		}
 	}
+	// the driver's own words survive the walk: "the cloud is full" and "rig
+	// asked the wrong question" are indistinguishable without them
 	for _, l := range []string{
-		"no capacity for 1H100.80S.30V in FIN-01, trying next",
-		"no capacity for 1H100.80S.30V in FIN-02, trying next",
+		"no capacity for 1H100.80S.30V in FIN-01, trying next (no GPUs left in FIN-01: no capacity)",
+		"no capacity for 1H100.80S.30V in FIN-02, trying next (no GPUs left in FIN-02: no capacity)",
 	} {
 		if !contains(*logs, l) {
 			t.Errorf("logs %q lack %q", *logs, l)
@@ -252,19 +254,39 @@ func TestProvisionDeletesInstanceThatReportsNoCapacity(t *testing.T) {
 	if v := prov.Deleted[0].VolumeIDs; len(v) != 1 || v[0] != "os-1" {
 		t.Errorf("deleted volumes = %v, want the OS volume os-1 only", v)
 	}
-	if !contains(*logs, "no capacity for 1H100.80S.30V in FIN-01, trying next") {
+	if !contains(*logs, `no capacity for 1H100.80S.30V in FIN-01, trying next (instance entered status "no_capacity": no capacity)`) {
 		t.Errorf("logs %q lack the retry line", *logs)
 	}
 }
 
-func TestProvisionExhaustedCandidatesIsNoneAvailable(t *testing.T) {
+// Exhausting the candidate list still opens with "none of … available", but
+// the drivers' reasons ride along: a Vast location-filter bug made every
+// create answer ErrNoCapacity and the generic message sent users looking at
+// the cloud's stock instead of at rig's query.
+func TestProvisionExhaustedCandidatesIsNoneAvailableWithTheDriversReason(t *testing.T) {
 	prov := fake.New()
 	prov.Avail = map[string][]string{"FIN-01": {"1H100.80S.30V"}}
 	prov.Creates = []error{noCapacity("FIN-01")}
 	app, _ := newApp(t, prov)
 
 	_, err := app.Provision(context.Background(), UpSpec{Name: "train", Types: []string{"1H100.80S.30V"}})
-	want := "none of 1H100.80S.30V available on-demand right now (rig types --available to see what is)"
+	want := "none of 1H100.80S.30V available on-demand right now (rig types --available to see what is); the provider said: no GPUs left in FIN-01: no capacity"
+	if err == nil || err.Error() != want {
+		t.Errorf("Provision = %v, want %q", err, want)
+	}
+}
+
+// One reason per distinct answer, however long the walk: the same refusal
+// from every candidate is one fact about the request, not four about stock.
+func TestProvisionReportsDistinctNoCapacityReasonsOnce(t *testing.T) {
+	prov := fake.New()
+	prov.Avail = map[string][]string{"FIN-01": {"1H100.80S.30V"}, "FIN-02": {"1H100.80S.30V"}, "ICE-01": {"1H100.80S.30V"}}
+	same := fmt.Errorf("geolocation eq matched no offer: %w", provider.ErrNoCapacity)
+	prov.Creates = []error{same, same, noCapacity("ICE-01")}
+	app, _ := newApp(t, prov)
+
+	_, err := app.Provision(context.Background(), UpSpec{Name: "train", Types: []string{"1H100.80S.30V"}})
+	want := "none of 1H100.80S.30V available on-demand right now (rig types --available to see what is); the provider said: geolocation eq matched no offer: no capacity; no GPUs left in ICE-01: no capacity"
 	if err == nil || err.Error() != want {
 		t.Errorf("Provision = %v, want %q", err, want)
 	}
@@ -387,8 +409,74 @@ func TestResolveFreshPicksTheSoleRunningInstance(t *testing.T) {
 	if in.Name != "rig-a" {
 		t.Errorf("Resolve(\"\") = %s, want rig-a (the only running one)", in.Name)
 	}
-	if in, err := app.Resolve(ctx, "b"); err != nil || in.ID != "fake-2" {
-		t.Errorf("Resolve(b) = %v, %v", in, err)
+	if in, err := app.ResolveFresh(ctx, "b"); err != nil || in.ID != "fake-2" {
+		t.Errorf("ResolveFresh(b) = %v, %v", in, err)
+	}
+}
+
+// A self-stopped instance is what a container provider's TTL watchdog leaves
+// behind, and it goes on billing its disk: rig down must select it with no
+// -i, saying it is stopped, while the ssh-based commands refuse it by name
+// and say why rather than claiming there is nothing there.
+func TestResolveFreshPicksTheSoleStoppedInstance(t *testing.T) {
+	prov := fake.New()
+	prov.Avail = map[string][]string{"FIN-01": {"1H100.80S.30V"}}
+	app, _ := newApp(t, prov)
+	ctx := context.Background()
+	if _, err := app.Provision(ctx, UpSpec{Name: "smoke", Types: []string{"1H100.80S.30V"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := prov.ShutdownInstance(ctx, "fake-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	in, err := app.ResolveFresh(ctx, "")
+	if err != nil {
+		t.Fatalf("ResolveFresh(\"\") = %v, want the stopped rig-smoke (a bare rig down must reach it)", err)
+	}
+	if in.Name != "rig-smoke" || in.Status != provider.Stopped {
+		t.Errorf("ResolveFresh(\"\") = %s (%s), want rig-smoke stopped", in.Name, in.Status)
+	}
+
+	want := "instance smoke is stopped, so there is nothing to connect to (rig down smoke deletes it; a stopped instance still bills its disk)"
+	for _, key := range []string{"", "smoke"} {
+		if _, err := app.Resolve(ctx, key); err == nil || err.Error() != want {
+			t.Errorf("Resolve(%q) = %v, want %q", key, err, want)
+		}
+	}
+}
+
+// Ambiguity is still an error, and it names every candidate with its status
+// so -i is the obvious next step.
+func TestResolveFreshAmbiguityListsCandidateStatuses(t *testing.T) {
+	prov := fake.New()
+	prov.Avail = map[string][]string{"FIN-01": {"1H100.80S.30V"}}
+	app, _ := newApp(t, prov)
+	ctx := context.Background()
+	for _, name := range []string{"a", "b", "c"} {
+		if _, err := app.Provision(ctx, UpSpec{Name: name, Types: []string{"1H100.80S.30V"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := prov.ShutdownInstance(ctx, "fake-2"); err != nil {
+		t.Fatal(err)
+	}
+	// the cloud has already discarded c: not a candidate, not an ambiguity
+	if err := prov.SetStatus("fake-3", provider.Gone); err != nil {
+		t.Fatal(err)
+	}
+
+	want := "multiple rig instances (a running, b stopped); pick one with -i"
+	if _, err := app.ResolveFresh(ctx, ""); err == nil || err.Error() != want {
+		t.Errorf("ResolveFresh(\"\") = %v, want %q", err, want)
+	}
+	// with two running, the ssh-based commands see the message they always did
+	if err := prov.StartInstance(ctx, "fake-2"); err != nil {
+		t.Fatal(err)
+	}
+	want = "multiple running instances (a, b); pick one with -i"
+	if _, err := app.Resolve(ctx, ""); err == nil || err.Error() != want {
+		t.Errorf("Resolve(\"\") = %v, want %q", err, want)
 	}
 }
 

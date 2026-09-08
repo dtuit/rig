@@ -69,19 +69,35 @@ func (a *App) stamp(in *provider.Instance) {
 	in.Provider = a.Provider()
 }
 
-// Resolve picks an instance by name/ID prefix; with empty key it returns the
-// sole running rig instance, erroring if that is ambiguous. A named key is
-// answered from the local instance cache when it can be (ADR-0006), so the
-// ssh-heavy commands skip the provider round-trip; the cached copy carries
-// the status and IP recorded at up/adopt time, not the live ones. Commands
-// that need the live view use ResolveFresh.
+// reach is what a resolve requires of the instance it answers with. The
+// ssh-based commands need one they can dial (reachable); the
+// teardown-and-inspect commands have work to do on an instance that merely
+// exists (existing) — a self-stopped container still bills its disk, so
+// tearing it down must not need -i.
+type reach int
+
+const (
+	// reachable admits a Running instance only: ssh, run, logs, sync, tunnel.
+	reachable reach = iota
+	// existing admits every instance the provider still has, Gone aside:
+	// down, extend, adopt.
+	existing
+)
+
+// Resolve picks an instance to connect to by name/ID prefix; with empty key
+// it returns the sole running rig instance, erroring if that is ambiguous or
+// if the one instance there is cannot be dialled. A named key is answered
+// from the local instance cache when it can be (ADR-0006), so the ssh-heavy
+// commands skip the provider round-trip; the cached copy carries the status
+// and IP recorded at up/adopt time, not the live ones. Commands whose work
+// does not need a reachable instance use ResolveFresh.
 func (a *App) Resolve(ctx context.Context, key string) (*provider.Instance, error) {
 	if key != "" {
 		if in := a.cached(key); in != nil {
 			return in, nil
 		}
 	}
-	return a.ResolveFresh(ctx, key)
+	return a.resolve(ctx, key, reachable)
 }
 
 // cached answers key from the instance cache, or nil on a miss. Cache
@@ -119,39 +135,104 @@ func match(instances []provider.Instance, key string) *provider.Instance {
 	return nil
 }
 
-// ResolveFresh is Resolve against the provider only — for status-bearing
-// commands (down, extend) whose answer must reflect the instance as it is
-// now, not as it was cached.
+// ResolveFresh is Resolve against the provider only, and it answers with a
+// stopped instance as readily as a running one — for the commands whose
+// answer must reflect the instance as it is now, not as it was cached, and
+// whose work does not need to reach it (down, extend, adopt). A single
+// self-stopped instance is exactly what a container provider's TTL watchdog
+// leaves behind, and it goes on billing its disk, so a bare rig down must
+// select it rather than send the user hunting for -i.
 func (a *App) ResolveFresh(ctx context.Context, key string) (*provider.Instance, error) {
+	return a.resolve(ctx, key, existing)
+}
+
+// resolve is the provider half of both resolvers, admitting only what want
+// asks for.
+func (a *App) resolve(ctx context.Context, key string, want reach) (*provider.Instance, error) {
 	instances, err := a.Managed(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if key == "" {
-		var running []provider.Instance
-		for _, in := range instances {
-			if in.Status == provider.Running {
-				running = append(running, in)
-			}
+		return sole(instances, want)
+	}
+	in := match(instances, key)
+	if in == nil {
+		return nil, fmt.Errorf("no rig instance matching %q", key)
+	}
+	if want == reachable && in.Status != provider.Running {
+		return nil, notRunning(in)
+	}
+	a.refreshCached(in)
+	return in, nil
+}
+
+// sole answers a keyless resolve: the one instance want admits, or an error
+// that names the alternatives with their statuses so -i is the obvious next
+// step. An instance the provider has already discarded (Gone) is nobody's
+// candidate and nobody's ambiguity.
+func sole(instances []provider.Instance, want reach) (*provider.Instance, error) {
+	var live, candidates []provider.Instance
+	for _, in := range instances {
+		if in.Status == provider.Gone {
+			continue
 		}
-		switch len(running) {
-		case 1:
-			return &running[0], nil
+		live = append(live, in)
+		if want == existing || in.Status == provider.Running {
+			candidates = append(candidates, in)
+		}
+	}
+	switch len(candidates) {
+	case 1:
+		return &candidates[0], nil
+	case 0:
+		switch len(live) {
 		case 0:
 			return nil, fmt.Errorf("no running rig instances (rig up to create one)")
+		case 1:
+			return nil, notRunning(&live[0])
 		default:
-			var names []string
-			for _, in := range running {
-				names = append(names, strings.TrimPrefix(in.Name, HostPrefix))
-			}
-			return nil, fmt.Errorf("multiple running instances (%s); pick one with -i", strings.Join(names, ", "))
+			return nil, fmt.Errorf("no running rig instances (%s); rig down deletes one, rig up creates another",
+				strings.Join(withStatus(live), ", "))
 		}
+	default:
+		if want == reachable {
+			return nil, fmt.Errorf("multiple running instances (%s); pick one with -i", strings.Join(shortNames(candidates), ", "))
+		}
+		return nil, fmt.Errorf("multiple rig instances (%s); pick one with -i", strings.Join(withStatus(candidates), ", "))
 	}
-	if in := match(instances, key); in != nil {
-		a.refreshCached(in)
-		return in, nil
+}
+
+// notRunning refuses an instance an ssh-based command cannot dial, saying
+// which state it is in instead of pretending there is nothing there: a
+// stopped instance is still costing money, and deleting it is the fix.
+func notRunning(in *provider.Instance) error {
+	short := shortName(in.Name)
+	if in.Status == provider.Stopped {
+		return fmt.Errorf("instance %s is stopped, so there is nothing to connect to (rig down %s deletes it; a stopped instance still bills its disk)", short, short)
 	}
-	return nil, fmt.Errorf("no rig instance matching %q", key)
+	return fmt.Errorf("instance %s is %s, not running (rig status to watch it)", short, in.Status)
+}
+
+// shortName is the name the user typed: the rig- prefix is rig's, not theirs.
+func shortName(name string) string { return strings.TrimPrefix(name, HostPrefix) }
+
+func shortNames(instances []provider.Instance) []string {
+	out := make([]string, 0, len(instances))
+	for _, in := range instances {
+		out = append(out, shortName(in.Name))
+	}
+	return out
+}
+
+// withStatus labels instances for an error the user has to choose from:
+// "train running, smoke stopped".
+func withStatus(instances []provider.Instance) []string {
+	out := make([]string, 0, len(instances))
+	for _, in := range instances {
+		out = append(out, shortName(in.Name)+" "+string(in.Status))
+	}
+	return out
 }
 
 // refreshCached rewrites in's cache entry when the endpoint it recorded is
@@ -282,20 +363,47 @@ func (a *App) Pick(ctx context.Context, spec UpSpec) ([]Candidate, error) {
 		}
 	}
 	if len(out) == 0 {
-		return nil, noneAvailable(spec)
+		return nil, noneAvailable(spec, nil)
 	}
 	return out, nil
 }
 
 // noneAvailable is the launch-failed answer when no candidate was offered or
-// every one turned out to have no capacity.
-func noneAvailable(spec UpSpec) error {
+// every one turned out to have no capacity. The drivers' own reasons ride
+// along, because from here "the cloud is full" and "rig asked the wrong
+// question" look identical: a location-filter bug made every Vast create
+// answer ErrNoCapacity, and dropping the reason hid it for a release.
+func noneAvailable(spec UpSpec, reasons []string) error {
 	mode := "on-demand"
 	if spec.Spot {
 		mode = "spot"
 	}
-	return fmt.Errorf("none of %s available %s%s right now (rig types --available to see what is)",
-		strings.Join(spec.Types, ", "), mode, pinSuffix(spec.Location))
+	return fmt.Errorf("none of %s available %s%s right now (rig types --available to see what is)%s",
+		strings.Join(spec.Types, ", "), mode, pinSuffix(spec.Location), because(reasons))
+}
+
+// because renders the collected reasons, capped so a long candidate walk
+// cannot turn one error into a wall of text.
+func because(reasons []string) string {
+	const most = 3
+	if len(reasons) == 0 {
+		return ""
+	}
+	if len(reasons) > most {
+		reasons = append(reasons[:most:most], fmt.Sprintf("(%d more)", len(reasons)-most))
+	}
+	return "; the provider said: " + strings.Join(reasons, "; ")
+}
+
+// addReason collects a driver's no-capacity text for the final error,
+// keeping each distinct reason once: a whole candidate list rejected for the
+// same reason is one fact about the request, not ten about the stock.
+func addReason(reasons []string, err error) []string {
+	r := strings.TrimSpace(err.Error())
+	if r == "" || slices.Contains(reasons, r) {
+		return reasons
+	}
+	return append(reasons, r)
 }
 
 func pinSuffix(loc string) string {
@@ -395,6 +503,7 @@ func (a *App) provision(ctx context.Context, spec UpSpec) (*provider.Instance, [
 	}
 
 	images := map[string]string{} // default image per type, looked up once
+	var reasons []string          // the drivers' own no-capacity words, deduped
 	for _, c := range candidates {
 		a.logf("selected %s in %s (spot=%v)", c.Type, c.Location, spec.Spot)
 
@@ -428,7 +537,8 @@ func (a *App) provision(ctx context.Context, spec UpSpec) (*provider.Instance, [
 		})
 		if err != nil {
 			if errors.Is(err, provider.ErrNoCapacity) {
-				a.logf("no capacity for %s in %s, trying next", c.Type, c.Location)
+				a.logf("no capacity for %s in %s, trying next (%v)", c.Type, c.Location, err)
+				reasons = addReason(reasons, err)
 				continue
 			}
 			return nil, nil, fmt.Errorf("create failed: %w", err)
@@ -437,7 +547,8 @@ func (a *App) provision(ctx context.Context, spec UpSpec) (*provider.Instance, [
 		in, err = a.waitRunning(ctx, in.ID, 20*time.Minute)
 		if err != nil {
 			if errors.Is(err, provider.ErrNoCapacity) {
-				a.logf("no capacity for %s in %s, trying next", c.Type, c.Location)
+				a.logf("no capacity for %s in %s, trying next (%v)", c.Type, c.Location, err)
+				reasons = addReason(reasons, err)
 				a.discard(ctx, in)
 				continue
 			}
@@ -446,7 +557,7 @@ func (a *App) provision(ctx context.Context, spec UpSpec) (*provider.Instance, [
 		a.stamp(in)
 		return in, volumes, nil
 	}
-	return nil, nil, noneAvailable(spec)
+	return nil, nil, noneAvailable(spec, reasons)
 }
 
 // imageFor answers spec.Image, or the provider's default image for typ,

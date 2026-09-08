@@ -1,7 +1,8 @@
 {
- "id": 403935,
- "username": "rig-tester",
- "balance": 7.5,
- "credit": 0.0,
- "email_verified": true
+  "id": 403935,
+  "username": "rig-tester",
+  "balance": 0,
+  "credit": 9.99419829187,
+  "email_verified": true,
+  "total_spend": -0.0058017081299999995
 }

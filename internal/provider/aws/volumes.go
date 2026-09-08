@@ -14,8 +14,10 @@ import (
 	"github.com/dtuit/rig/internal/provider"
 )
 
-// ListVolumes is every EBS volume tagged rig:managed, each carrying the
-// mkdir and mount commands core runs after attaching it.
+// ListVolumes is every EBS data volume tagged rig:managed, each carrying
+// the mkdir and mount commands core runs after attaching it. Boot volumes
+// carry the same tag (RunInstances tags what it creates) and are marked
+// rig:os=true; they are not data volumes, so they are skipped.
 func (d *Driver) ListVolumes(ctx context.Context) ([]provider.Volume, error) {
 	if err := d.clients(ctx); err != nil {
 		return nil, err
@@ -30,6 +32,9 @@ func (d *Driver) ListVolumes(ctx context.Context) ([]provider.Volume, error) {
 			return nil, d.fail("listing volumes", err)
 		}
 		for _, v := range page.Volumes {
+			if tagValue(v.Tags, osVolumeTag) == "true" {
+				continue
+			}
 			out = append(out, fromEC2Volume(v))
 		}
 	}

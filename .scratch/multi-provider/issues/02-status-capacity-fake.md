@@ -60,3 +60,45 @@ Down, Resolve/ResolveFresh. Deviations: `internal/cli/json_test.go`'s `fakeProvi
 unit-tested because `fromSDKInstance` is reachable only through the SDK client. Follow-up: when a
 data volume is created for a candidate that then has no capacity, the volume is left in that
 location (data volumes survive by contract) and the next candidate finds-or-creates its own.
+
+2026-09-08 (agent, post-smoke core fixes): two defects the live RunPod and Vast runs surfaced
+(issue 06 / issue 08 follow-ups (a) and (b)) fixed in `internal/core`, since neither belongs to a
+driver.
+
+**1. A self-stopped instance could not be torn down without -i.** `ResolveFresh("")` only
+auto-selected `provider.Running`, so after a container provider's TTL watchdog did its job — stop
+the instance — a bare `rig down` answered "no running rig instances (rig up to create one)" while
+the stopped pod kept billing its volume disk ($0.20/GB/mo on RunPod, storage on Vast, EBS on EC2).
+The resolve path now takes an unexported `reach` (`reachable` | `existing`): `Resolve` (cache-first,
+the ssh-based commands — ssh, run, logs, ps, stop, sync, fetch, wait, tunnel) asks for `reachable`,
+`ResolveFresh` (down, extend, adopt) asks for `existing`, which admits every instance the provider
+still has, `Gone` aside. Both share `App.resolve`; `sole` answers the keyless case. Messages:
+a lone unreachable instance now gets `instance smoke is stopped, so there is nothing to connect to
+(rig down smoke deletes it; a stopped instance still bills its disk)` (or `instance smoke is
+provisioning, not running (rig status to watch it)`); ambiguity on the teardown path is `multiple
+rig instances (a running, b stopped); pick one with -i`, and on the ssh path the old `multiple
+running instances (a, b); pick one with -i` is unchanged; an empty fleet still reads `no running rig
+instances (rig up to create one)`. `rig down`'s confirmation prompt now labels a non-running target
+with its status — `delete instance smoke (stopped)?` — for `--all` too
+(`internal/cli/lifecycle.go`, which now carries `[]provider.Instance` targets instead of names).
+A named `-i` resolve on the ssh path is now refused when the *fresh* status is not Running; a cache
+hit still answers as before (ADR-0006: the cached status is advisory).
+
+**2. The candidate walk swallowed the driver's reason.** A Vast location-filter bug made every
+create answer `ErrNoCapacity`, and core reported the generic "none of … available … right now",
+pointing at the cloud's stock instead of at rig's malformed query. `provision` now logs
+`no capacity for <type> in <loc>, trying next (<the driver's error>)` and collects the distinct
+reasons (`addReason`); `noneAvailable(spec, reasons)` keeps its opening and appends
+`; the provider said: <reason>[; <reason>]`, capped at three with `(N more)`.
+
+Tests (`internal/core/core_test.go`): `TestResolveFreshPicksTheSoleStoppedInstance` and
+`TestResolveFreshAmbiguityListsCandidateStatuses` (new), plus a thin CLI test
+`TestDownSelectsAStoppedInstanceAndSaysSo` in the new `internal/cli/lifecycle_test.go` (declined
+prompt, asserts the "(stopped)" label). `internal/provider/fake` gained
+`Provider.SetStatus(id, status)` so a test can stage a listing status no rig command produces
+(`Gone`). Changed assertions: `TestProvisionExhaustedCandidatesIsNoneAvailable` is renamed
+`…IsNoneAvailableWithTheDriversReason` and expects the appended reason (a second test,
+`TestProvisionReportsDistinctNoCapacityReasonsOnce`, covers deduping), and the two candidate-walk
+log-line assertions now expect the `(…)` reason suffix. `TestResolveFreshPicksTheSoleRunningInstance`
+keeps its keyless assertions; its named lookup of the stopped instance moved from `Resolve` to
+`ResolveFresh`, which is the resolver that contract now belongs to.

@@ -134,7 +134,7 @@ func newDownCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			var targets []string
+			var targets []provider.Instance
 			if all {
 				instances, err := a.Managed(cmd.Context())
 				if err != nil {
@@ -142,7 +142,7 @@ func newDownCmd() *cobra.Command {
 				}
 				for _, in := range instances {
 					if in.Status != provider.Gone {
-						targets = append(targets, in.Name)
+						targets = append(targets, in)
 					}
 				}
 				if len(targets) == 0 {
@@ -154,26 +154,35 @@ func newDownCmd() *cobra.Command {
 				if len(args) == 1 {
 					key = args[0]
 				}
-				// fresh: a teardown must target the instance as it is now, not as cached
+				// fresh: a teardown must target the instance as it is now, not as
+				// cached, and a stopped instance is the normal thing to tear down
 				in, err := a.ResolveFresh(cmd.Context(), key)
 				if err != nil {
 					return err
 				}
-				targets = []string{in.Name}
+				targets = []provider.Instance{*in}
 			}
 			shorts := make([]string, 0, len(targets))
-			for _, name := range targets {
-				shorts = append(shorts, strings.TrimPrefix(name, core.HostPrefix))
+			labels := make([]string, 0, len(targets))
+			for _, in := range targets {
+				short := strings.TrimPrefix(in.Name, core.HostPrefix)
+				shorts = append(shorts, short)
+				// the prompt must say what is about to be destroyed, status
+				// included: a stopped instance was picked without being named
+				if in.Status != provider.Running {
+					short += fmt.Sprintf(" (%s)", in.Status)
+				}
+				labels = append(labels, short)
 			}
 			verb := "delete instance"
 			if delVolumes {
 				verb = "delete instance AND ATTACHED DATA VOLUMES"
 			}
-			if !yes && !confirm(fmt.Sprintf("%s %s?", verb, strings.Join(shorts, ", "))) {
+			if !yes && !confirm(fmt.Sprintf("%s %s?", verb, strings.Join(labels, ", "))) {
 				return fmt.Errorf("aborted")
 			}
-			for i, name := range targets {
-				in, err := a.ResolveFresh(cmd.Context(), name)
+			for i, target := range targets {
+				in, err := a.ResolveFresh(cmd.Context(), target.Name)
 				if err != nil {
 					return err
 				}

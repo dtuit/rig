@@ -29,13 +29,39 @@ var envNames = []string{"VAST_API_KEY"}
 // torch build that matches the host's driver (tag list checked 2026-09-08).
 const DefaultImage = "vastai/pytorch:cuda-12.8.1-auto"
 
-// selfStop is the watchdog's stop line: Vast injects CONTAINER_ID and the
-// instance-scoped CONTAINER_API_KEY into the container's environment and
-// writes them to /etc/environment, which an ssh session does not inherit,
-// so the line sources that file first.
-const selfStop = `[ -f /etc/environment ] && set -a && . /etc/environment; set +a; ` +
-	`curl -fsS -X PUT "https://console.vast.ai/api/v0/instances/$CONTAINER_ID/" ` +
-	`-H "Authorization: Bearer $CONTAINER_API_KEY" -H 'Content-Type: application/json' -d '{"state":"stopped"}'`
+// Where a Vast container keeps the credentials that stop it. Vast injects
+// CONTAINER_ID and the instance-scoped CONTAINER_API_KEY into the
+// container's environment, so PID 1 — the platform's own launcher — always
+// has the pair; /root/.vast_api_key and /root/.vast_containerlabel
+// ("C.<id>") are Vast's own copies, verified byte-identical to the injected
+// key on instance 50300289 (live 2026-09-08).
+const (
+	procEnviron        = "/proc/1/environ"
+	containerKeyFile   = "/root/.vast_api_key"
+	containerLabelFile = "/root/.vast_containerlabel"
+)
+
+// selfStop is the watchdog's stop line (ADR-0003: the instance-scoped key,
+// never the account's). An ssh session inherits neither variable — and
+// /etc/environment, which the docs point at, holds only the image's
+// build-time env on a Vast container and cannot even be sourced safely
+// (`NVIDIA_REQUIRE_CUDA=cuda>=12.8 brand=unknown` redirects) — so the pair
+// is read out of PID 1's environment instead.
+var selfStop = renderSelfStop(procEnviron, containerKeyFile, containerLabelFile)
+
+// renderSelfStop builds the stop line reading the container's credentials
+// from environ, falling back to Vast's own keyFile and labelFile when PID 1
+// is not readable. The paths are arguments so the test can run the real
+// line against fixtures.
+func renderSelfStop(environ, keyFile, labelFile string) string {
+	return `e=$(cat ` + environ + ` 2>/dev/null | tr '\0' '\n'); ` +
+		`cid=$(printf '%s\n' "$e" | sed -n 's/^CONTAINER_ID=//p' | head -1); ` +
+		`key=$(printf '%s\n' "$e" | sed -n 's/^CONTAINER_API_KEY=//p' | head -1); ` +
+		`[ -n "$cid" ] || cid=$(sed -n 's/^C\.//p' ` + labelFile + ` 2>/dev/null); ` +
+		`[ -n "$key" ] || key=$(cat ` + keyFile + ` 2>/dev/null); ` +
+		`curl -fsS -X PUT "https://console.vast.ai/api/v0/instances/$cid/" ` +
+		`-H "Authorization: Bearer $key" -H 'Content-Type: application/json' -d '{"state":"stopped"}'`
+}
 
 // onstart is the container start hook rig hands every instance: Vast's ssh
 // mode drops logins into tmux by default, which would wrap `rig ssh -- cmd`,
@@ -255,15 +281,17 @@ func (d *Driver) EnsureSSHKey(ctx context.Context, _ string, pubkey string) (str
 	return "", nil
 }
 
-// Balance is the account's prepaid credit in USD.
+// Balance is the account's prepaid credit in USD — `credit`, not
+// `balance`: on a funded renter account the two are $10.00 and 0 (live
+// 2026-09-08), because `balance` is a host's unpaid earnings.
 func (d *Driver) Balance(ctx context.Context) (float64, string, error) {
 	var res struct {
-		Balance float64 `json:"balance"`
+		Credit float64 `json:"credit"`
 	}
 	if err := d.c.do(ctx, "GET", "/users/current/", nil, nil, &res); err != nil {
 		return 0, "", err
 	}
-	return res.Balance, "USD", nil
+	return res.Credit, "USD", nil
 }
 
 func contains(list []string, s string) bool {

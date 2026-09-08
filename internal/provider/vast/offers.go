@@ -80,6 +80,39 @@ func (d *Driver) remember(offers []offer) {
 	}
 }
 
+// countryCode is what an offer query's geolocation clause takes: the
+// host's upper-case two-letter country code. Vast spells the location out
+// in responses ("South Korea, KR") but filters on the code alone — measured
+// live 2026-09-08, where `geolocation eq "South Korea, KR"` and a
+// lower-case "kr" both matched nothing — so a location pin is narrowed
+// server-side by code and matched exactly by matchesLocation afterwards.
+// A pin the code cannot be read from yields "" (no clause).
+func countryCode(geo string) string {
+	geo = strings.TrimSpace(geo)
+	if i := strings.LastIndex(geo, ","); i >= 0 {
+		geo = strings.TrimSpace(geo[i+1:])
+	}
+	if len(geo) != 2 {
+		return ""
+	}
+	return strings.ToUpper(geo)
+}
+
+// matchesLocation reports whether an offer's geolocation satisfies a
+// location pin. A bare country code ("US") takes any host in that country;
+// anything else must equal the geolocation as Vast spells it, which is how
+// rig types and rig locations print it.
+func matchesLocation(geo, pin string) bool {
+	pin = strings.TrimSpace(pin)
+	if pin == "" {
+		return true
+	}
+	if !strings.Contains(pin, ",") && len(pin) == 2 {
+		return strings.EqualFold(countryCode(geo), pin)
+	}
+	return strings.EqualFold(strings.TrimSpace(geo), pin)
+}
+
 // searchType is Vast's offer market: on-demand rentals or bids.
 type searchType string
 
@@ -129,10 +162,11 @@ func (d *Driver) search(ctx context.Context, q map[string]any) ([]offer, error) 
 // maxPages bounds the catalogue crawl.
 const maxPages = 8
 
-// searchAll crawls every offer of one market type by paging on price
-// (`dph_total gt <last seen>`): a page is capped at pageSize whatever limit
-// is asked for. Bid pages can overlap, so offers are deduplicated by id.
-func (d *Driver) searchAll(ctx context.Context, typ searchType) ([]offer, error) {
+// searchAll crawls every offer of one market type matching base by paging
+// on price (`dph_total gt <last seen>`): a page is capped at pageSize
+// whatever limit is asked for, so one search never sees the whole market.
+// Bid pages can overlap, so offers are deduplicated by id.
+func (d *Driver) searchAll(ctx context.Context, typ searchType, base map[string]any) ([]offer, error) {
 	var (
 		out  []offer
 		seen = map[int64]bool{}
@@ -140,6 +174,9 @@ func (d *Driver) searchAll(ctx context.Context, typ searchType) ([]offer, error)
 	)
 	for page := 0; page < maxPages; page++ {
 		clauses := map[string]any{}
+		for k, v := range base {
+			clauses[k] = v
+		}
 		if page > 0 {
 			cursor := map[string]any{"gt": last}
 			if user, ok := d.cfg.Filters["dph_total"].(map[string]any); ok {
@@ -182,11 +219,11 @@ func (d *Driver) catalogue(ctx context.Context) (*catalogue, error) {
 	if cat != nil && time.Since(cat.at) < catalogueTTL {
 		return cat, nil
 	}
-	od, err := d.searchAll(ctx, onDemand)
+	od, err := d.searchAll(ctx, onDemand, nil)
 	if err != nil {
 		return nil, err
 	}
-	bids, err := d.searchAll(ctx, bid)
+	bids, err := d.searchAll(ctx, bid, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -4,15 +4,18 @@
 // volumes that the driver's synthesised mount command finds by serial, and
 // the default image is the Deep Learning Base GPU AMI resolved through SSM.
 // Credentials come from the SDK default chain (environment, shared config,
-// SSO) plus an optional profile. AWS has no balance API, so Balance is
-// unsupported; capacity is only known at RunInstances time, so
-// CreateInstance wraps ErrNoCapacity for core's candidate walk.
+// SSO) plus an optional profile. The security group rig creates admits ssh
+// from the operator's own public address only, or from the blocks
+// providers.aws.ssh_cidrs names (see ingress.go). AWS has no balance API,
+// so Balance is unsupported; capacity is only known at RunInstances time,
+// so CreateInstance wraps ErrNoCapacity for core's candidate walk.
 package aws
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,8 +42,24 @@ type Config struct {
 	// the SDK chain supplies one (AWS_REGION, the profile's region).
 	Region string `yaml:"region"`
 	// SecurityGroup is the name of the group opened for ssh, created in the
-	// default VPC on first use. Default "rig".
+	// launch VPC on first use. Default "rig".
 	SecurityGroup string `yaml:"security_group"`
+	// SSHCIDRs are the blocks that group admits on 22/tcp — CIDRs, or bare
+	// addresses meaning /32. Empty discovers the operator's public IP and
+	// admits that one address; a launch is refused rather than opened to
+	// the internet when the address cannot be determined. Set
+	// ["0.0.0.0/0"] deliberately to accept the whole internet.
+	SSHCIDRs []string `yaml:"ssh_cidrs"`
+	// VPC is the VPC to launch in; empty uses the region's default VPC.
+	// Accounts without a default VPC (deleted for compliance, or an older
+	// account that never had one) must set this or Subnets.
+	VPC string `yaml:"vpc"`
+	// Subnets are explicit subnet ids, at most one per zone, and imply
+	// their VPC. A zone none of them covers cannot be launched in, so list
+	// one per zone rig should use. Empty picks a subnet in the chosen zone
+	// from VPC, preferring the zone's default subnet and then one that
+	// assigns public IPs.
+	Subnets []string `yaml:"subnets"`
 	// DefaultImage is an SSM parameter path (starts with /) or an AMI id
 	// (ami-…). Empty picks the Deep Learning Base GPU AMI for GPU types and
 	// plain Ubuntu 24.04 otherwise.
@@ -58,6 +77,14 @@ const (
 	// managedTag marks every instance, volume, key and group rig creates;
 	// ListInstances and ListVolumes filter on it.
 	managedTag = "rig:managed"
+	// purposeTag says what a group rig created is for, so a VPC audit can
+	// read the answer off the resource.
+	purposeTag = "rig:purpose"
+	// osVolumeTag marks the boot volume RunInstances creates, which
+	// carries managedTag like everything else but is not a data volume:
+	// ListVolumes hides it, so it is neither offered to core's
+	// find-or-create-in-location nor removable with rig volumes --rm.
+	osVolumeTag = "rig:os"
 	// sshUser is the login user of both default AMIs.
 	sshUser = "ubuntu"
 
@@ -133,6 +160,10 @@ type Driver struct {
 	pricing pricingAPI
 	region  string // resolved region, cfg.Region until the SDK chain fills it
 
+	// publicIP discovers the operator's public address for the ssh
+	// ingress rule; tests replace it.
+	publicIP func(context.Context) (netip.Addr, error)
+
 	cacheDir string        // pricing cache directory; empty = do not persist
 	poll     time.Duration // between polls while waiting on EC2 state
 	now      func() time.Time
@@ -163,6 +194,7 @@ func New(cfg Config) *Driver {
 	}
 	return &Driver{
 		cfg:         cfg,
+		publicIP:    discoverPublicIP,
 		region:      cfg.Region,
 		cacheDir:    dir,
 		poll:        10 * time.Second,

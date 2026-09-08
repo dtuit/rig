@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +30,8 @@ var launch = time.Date(2026, 9, 8, 3, 0, 0, 0, time.UTC)
 // mutating calls record what they were asked and answer from scripted
 // errors. Anything unscripted answers empty.
 type fakeEC2 struct {
+	vpcCalls  int
+	typeCalls int
 	zones     []types.AvailabilityZone
 	typeInfos []types.InstanceTypeInfo
 	offerings []types.InstanceTypeOffering
@@ -48,17 +51,18 @@ type fakeEC2 struct {
 
 	imageCalls int // DescribeImages calls, to prove the root device is cached
 
-	runIn        *ec2.RunInstancesInput
-	imported     *ec2.ImportKeyPairInput
-	createdGroup *ec2.CreateSecurityGroupInput
-	authorized   *ec2.AuthorizeSecurityGroupIngressInput
-	terminated   []string
-	stopped      []string
-	started      []string
-	attached     []*ec2.AttachVolumeInput
-	detached     []*ec2.DetachVolumeInput
-	deletedVols  []string
-	createdVol   *ec2.CreateVolumeInput
+	runIn          *ec2.RunInstancesInput
+	imported       *ec2.ImportKeyPairInput
+	createdGroup   *ec2.CreateSecurityGroupInput
+	authorized     *ec2.AuthorizeSecurityGroupIngressInput   // the last one
+	authorizeCalls []*ec2.AuthorizeSecurityGroupIngressInput // every one, in order
+	terminated     []string
+	stopped        []string
+	started        []string
+	attached       []*ec2.AttachVolumeInput
+	detached       []*ec2.DetachVolumeInput
+	deletedVols    []string
+	createdVol     *ec2.CreateVolumeInput
 }
 
 func (f *fakeEC2) DescribeAvailabilityZones(context.Context, *ec2.DescribeAvailabilityZonesInput, ...func(*ec2.Options)) (*ec2.DescribeAvailabilityZonesOutput, error) {
@@ -69,6 +73,7 @@ func (f *fakeEC2) DescribeAvailabilityZones(context.Context, *ec2.DescribeAvaila
 }
 
 func (f *fakeEC2) DescribeInstanceTypes(context.Context, *ec2.DescribeInstanceTypesInput, ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error) {
+	f.typeCalls++
 	return &ec2.DescribeInstanceTypesOutput{InstanceTypes: f.typeInfos}, nil
 }
 
@@ -104,6 +109,7 @@ func (f *fakeEC2) ImportKeyPair(_ context.Context, in *ec2.ImportKeyPairInput, _
 }
 
 func (f *fakeEC2) DescribeVpcs(context.Context, *ec2.DescribeVpcsInput, ...func(*ec2.Options)) (*ec2.DescribeVpcsOutput, error) {
+	f.vpcCalls++
 	return &ec2.DescribeVpcsOutput{Vpcs: f.vpcs}, nil
 }
 
@@ -122,6 +128,7 @@ func (f *fakeEC2) CreateSecurityGroup(_ context.Context, in *ec2.CreateSecurityG
 
 func (f *fakeEC2) AuthorizeSecurityGroupIngress(_ context.Context, in *ec2.AuthorizeSecurityGroupIngressInput, _ ...func(*ec2.Options)) (*ec2.AuthorizeSecurityGroupIngressOutput, error) {
 	f.authorized = in
+	f.authorizeCalls = append(f.authorizeCalls, in)
 	return &ec2.AuthorizeSecurityGroupIngressOutput{}, nil
 }
 
@@ -238,10 +245,21 @@ func priceDoc(instanceType, usd string) string {
 // throwaway pricing cache directory and no waiting between polls.
 func newTestDriver(t *testing.T, e *fakeEC2, s *fakeSSM, p *fakePricing) *Driver {
 	t.Helper()
-	d := New(Config{Profile: "work", Region: "ap-southeast-2"})
+	return newTestDriverConfig(t, Config{Profile: "work", Region: "ap-southeast-2"}, e, s, p)
+}
+
+func newTestDriverConfig(t *testing.T, cfg Config, e *fakeEC2, s *fakeSSM, p *fakePricing) *Driver {
+	t.Helper()
+	if cfg.Region == "" {
+		cfg.Region = "ap-southeast-2"
+	}
+	d := New(cfg)
 	d.ec2, d.ssm, d.pricing = e, s, p
 	d.cacheDir = t.TempDir()
 	d.poll = 0
+	// No test may reach the public-IP service; every test that creates a
+	// security group needs an address to authorise.
+	d.publicIP = func(context.Context) (netip.Addr, error) { return netip.MustParseAddr(testIP), nil }
 	return d
 }
 
@@ -277,9 +295,38 @@ func ec2Instance(id, name string, state types.InstanceStateName, ip string) type
 func defaultNetwork() (vpcs []types.Vpc, subnets []types.Subnet) {
 	return []types.Vpc{{VpcId: sdk.String("vpc-0def"), IsDefault: sdk.Bool(true)}},
 		[]types.Subnet{
-			{SubnetId: sdk.String("subnet-0b"), AvailabilityZone: sdk.String("ap-southeast-2b"), DefaultForAz: sdk.Bool(true)},
-			{SubnetId: sdk.String("subnet-0a"), AvailabilityZone: sdk.String("ap-southeast-2a"), DefaultForAz: sdk.Bool(true)},
+			{SubnetId: sdk.String("subnet-0b"), VpcId: sdk.String("vpc-0def"), AvailabilityZone: sdk.String("ap-southeast-2b"), DefaultForAz: sdk.Bool(true)},
+			{SubnetId: sdk.String("subnet-0a"), VpcId: sdk.String("vpc-0def"), AvailabilityZone: sdk.String("ap-southeast-2a"), DefaultForAz: sdk.Bool(true)},
 		}
+}
+
+func TestListInstancesReportsTheGPUWithoutInstanceTypes(t *testing.T) {
+	// A live rig status --json reported gpu:"" for a running g4dn.xlarge,
+	// because only InstanceTypes filled the type -> GPU cache and status
+	// never calls it. A listing must resolve the GPU itself.
+	e := &fakeEC2{
+		instances: []types.Instance{ec2Instance("i-0run", "rig-train", types.InstanceStateNameRunning, "13.210.1.2")},
+		typeInfos: []types.InstanceTypeInfo{{
+			InstanceType: types.InstanceTypeG5Xlarge,
+			GpuInfo:      &types.GpuInfo{Gpus: []types.GpuDeviceInfo{{Manufacturer: sdk.String("NVIDIA"), Name: sdk.String("A10G"), Count: sdk.Int32(1)}}, TotalGpuMemoryInMiB: sdk.Int32(24576)},
+		}},
+	}
+	d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+	got, err := d.ListInstances(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].GPU != "NVIDIA A10G" {
+		t.Fatalf("GPU = %q, want NVIDIA A10G", got[0].GPU)
+	}
+	// Learned once: a second listing asks EC2 nothing more.
+	before := e.typeCalls
+	if _, err := d.ListInstances(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if e.typeCalls != before {
+		t.Errorf("DescribeInstanceTypes called again (%d -> %d), want the answer cached", before, e.typeCalls)
+	}
 }
 
 func TestListInstancesMapsStateAndEndpoint(t *testing.T) {
@@ -587,7 +634,7 @@ func TestCreateInstanceRequestShapeAndNetworkOnFirstUse(t *testing.T) {
 	}
 	if e.authorized == nil || *e.authorized.GroupId != "sg-0new" || len(e.authorized.IpPermissions) != 1 ||
 		*e.authorized.IpPermissions[0].FromPort != 22 || *e.authorized.IpPermissions[0].ToPort != 22 ||
-		*e.authorized.IpPermissions[0].IpRanges[0].CidrIp != "0.0.0.0/0" {
+		*e.authorized.IpPermissions[0].IpRanges[0].CidrIp != testIP+"/32" {
 		t.Errorf("AuthorizeSecurityGroupIngress = %+v", e.authorized)
 	}
 
@@ -708,6 +755,74 @@ func TestCreateInstanceNeedsADefaultVPCAndSubnet(t *testing.T) {
 	}
 }
 
+func TestCreateInstanceUsesConfiguredSubnets(t *testing.T) {
+	_, subnets := defaultNetwork()
+	// No default VPC in the account at all: the configured subnet is the
+	// only thing that can place the launch.
+	e := &fakeEC2{subnets: subnets, images: []types.Image{{ImageId: sdk.String("ami-0abc"), RootDeviceName: sdk.String("/dev/sda1")}}}
+	d := newTestDriverConfig(t, Config{Subnets: []string{"subnet-0a"}}, e, &fakeSSM{}, &fakePricing{})
+	if _, err := d.CreateInstance(t.Context(), provider.CreateInstanceRequest{Type: "g5.xlarge", Image: "ami-0abc", Name: "rig-train", Location: "ap-southeast-2a", SSHKeyIDs: []string{"k"}}); err != nil {
+		t.Fatal(err)
+	}
+	if e.vpcCalls != 0 {
+		t.Errorf("DescribeVpcs called %d times, want 0 (the subnet names its VPC)", e.vpcCalls)
+	}
+	if got := *e.runIn.NetworkInterfaces[0].SubnetId; got != "subnet-0a" {
+		t.Errorf("SubnetId = %q, want the configured subnet in the zone", got)
+	}
+	if got := *e.createdGroup.VpcId; got != "vpc-0def" {
+		t.Errorf("security group VpcId = %q, want the subnet's VPC", got)
+	}
+
+	// A zone the configured subnets do not cover is a clear error, not a
+	// silent launch somewhere else.
+	e = &fakeEC2{subnets: subnets}
+	d = newTestDriverConfig(t, Config{Subnets: []string{"subnet-0a"}}, e, &fakeSSM{}, &fakePricing{})
+	_, err := d.CreateInstance(t.Context(), provider.CreateInstanceRequest{Type: "g5.xlarge", Image: "ami-0abc", Name: "rig-train", Location: "ap-southeast-2b", SSHKeyIDs: []string{"k"}})
+	if err == nil || !strings.Contains(err.Error(), "ap-southeast-2b") || !strings.Contains(err.Error(), "subnets") {
+		t.Errorf("err = %v, want it to name the uncovered zone and the subnets key", err)
+	}
+	if e.runIn != nil {
+		t.Error("RunInstances was called for a zone with no configured subnet")
+	}
+}
+
+func TestCreateInstanceUsesConfiguredVPC(t *testing.T) {
+	_, subnets := defaultNetwork()
+	for i := range subnets {
+		subnets[i].VpcId = sdk.String("vpc-0own")
+		subnets[i].DefaultForAz = sdk.Bool(false)
+	}
+	subnets[1].MapPublicIpOnLaunch = sdk.Bool(true) // the 2a subnet
+	e := &fakeEC2{subnets: subnets, images: []types.Image{{ImageId: sdk.String("ami-0abc"), RootDeviceName: sdk.String("/dev/sda1")}}}
+	d := newTestDriverConfig(t, Config{VPC: "vpc-0own"}, e, &fakeSSM{}, &fakePricing{})
+	if _, err := d.CreateInstance(t.Context(), provider.CreateInstanceRequest{Type: "g5.xlarge", Image: "ami-0abc", Name: "rig-train", Location: "ap-southeast-2a", SSHKeyIDs: []string{"k"}}); err != nil {
+		t.Fatal(err)
+	}
+	if e.vpcCalls != 0 {
+		t.Errorf("DescribeVpcs called %d times, want 0 (the VPC is configured)", e.vpcCalls)
+	}
+	if got := *e.runIn.NetworkInterfaces[0].SubnetId; got != "subnet-0a" {
+		t.Errorf("SubnetId = %q, want the public subnet in the zone", got)
+	}
+	if got := *e.createdGroup.VpcId; got != "vpc-0own" {
+		t.Errorf("security group VpcId = %q, want the configured VPC", got)
+	}
+}
+
+func TestCreateInstanceMissingDefaultVPCNamesTheConfigKeys(t *testing.T) {
+	d := newTestDriver(t, &fakeEC2{}, &fakeSSM{}, &fakePricing{})
+	_, err := d.CreateInstance(t.Context(), provider.CreateInstanceRequest{Type: "g5.xlarge", Image: "ami-0abc", Name: "rig-train", Location: "ap-southeast-2a", SSHKeyIDs: []string{"k"}})
+	if err == nil {
+		t.Fatal("want an error with no default VPC and no configured VPC")
+	}
+	for _, want := range []string{"create-default-vpc", "providers.aws.vpc", "providers.aws.subnets"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to mention %q", err, want)
+		}
+	}
+}
+
 func TestDeleteInstanceTerminatesAndDeletesOnlyDataVolumes(t *testing.T) {
 	e := &fakeEC2{
 		instances: []types.Instance{ec2Instance("i-0run", "rig-train", types.InstanceStateNameRunning, "13.210.1.2")},
@@ -806,6 +921,61 @@ func TestListVolumesSynthesisesMountCommands(t *testing.T) {
 	got, err := d.GetVolume(t.Context(), "vol-0abc")
 	if err != nil || got.Name != "data" {
 		t.Errorf("GetVolume = %+v, %v", got, err)
+	}
+}
+
+func TestListVolumesSkipsOSVolumes(t *testing.T) {
+	// RunInstances tags the boot volume it creates, so the account holds
+	// rig:managed volumes that are not data volumes; a live t3.medium
+	// smoke produced an 8GB "rig-smoke" root beside the 10GB data volume
+	// of the same name. rig volumes must show only the data volume.
+	e := &fakeEC2{volumes: []types.Volume{{
+		VolumeId:         sdk.String("vol-0data"),
+		Size:             sdk.Int32(10),
+		VolumeType:       types.VolumeTypeGp3,
+		State:            types.VolumeStateAvailable,
+		AvailabilityZone: sdk.String("ap-southeast-2a"),
+		Tags:             []types.Tag{tag("Name", "rig-smoke"), tag("rig:managed", "true")},
+	}, {
+		VolumeId:         sdk.String("vol-0root"),
+		Size:             sdk.Int32(8),
+		VolumeType:       types.VolumeTypeGp3,
+		State:            types.VolumeStateInUse,
+		AvailabilityZone: sdk.String("ap-southeast-2a"),
+		Tags:             []types.Tag{tag("Name", "rig-smoke"), tag("rig:managed", "true"), tag("rig:os", "true")},
+	}}}
+	d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+	vols, err := d.ListVolumes(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vols) != 1 || vols[0].ID != "vol-0data" {
+		t.Fatalf("volumes = %+v, want only the data volume", vols)
+	}
+}
+
+func TestCreateInstanceMarksTheOSVolume(t *testing.T) {
+	vpcs, subnets := defaultNetwork()
+	e := &fakeEC2{vpcs: vpcs, subnets: subnets, images: []types.Image{{ImageId: sdk.String("ami-0abc"), RootDeviceName: sdk.String("/dev/sda1")}}}
+	d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+	if _, err := d.CreateInstance(t.Context(), provider.CreateInstanceRequest{Type: "g5.xlarge", Image: "ami-0abc", Name: "rig-train", Location: "ap-southeast-2a", SSHKeyIDs: []string{"k"}}); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]string
+	for _, ts := range e.runIn.TagSpecifications {
+		if ts.ResourceType != types.ResourceTypeVolume {
+			continue
+		}
+		got = map[string]string{}
+		for _, tg := range ts.Tags {
+			got[*tg.Key] = *tg.Value
+		}
+	}
+	if got == nil {
+		t.Fatal("no volume TagSpecification on RunInstances")
+	}
+	if got["rig:os"] != "true" || got["rig:managed"] != "true" || got["Name"] != "rig-train" {
+		t.Errorf("volume tags = %v, want the boot volume marked rig:os=true", got)
 	}
 }
 
@@ -1034,5 +1204,248 @@ func TestEnsureSSHKeyChecksTheFingerprint(t *testing.T) {
 	}
 	if len(*lines) != 1 || !strings.Contains((*lines)[0], "rig-key") {
 		t.Errorf("warnings = %v, want one line naming the key pair rig could not verify", *lines)
+	}
+}
+
+// --- ssh ingress ---------------------------------------------------------
+
+// testIP is what the fake public-IP discovery reports: an address in
+// TEST-NET-3, which no real operator can hold.
+const testIP = "203.0.113.7"
+
+// sgWith is a security group named rig holding one 22/tcp rule per cidr,
+// tagged rig:managed=true only when managed.
+func sgWith(managed bool, cidrs ...string) types.SecurityGroup {
+	g := types.SecurityGroup{GroupId: sdk.String("sg-0old"), GroupName: sdk.String("rig"), VpcId: sdk.String("vpc-0def")}
+	if managed {
+		g.Tags = managedTags("rig")
+	}
+	perm := types.IpPermission{IpProtocol: sdk.String("tcp"), FromPort: sdk.Int32(22), ToPort: sdk.Int32(22)}
+	for _, c := range cidrs {
+		perm.IpRanges = append(perm.IpRanges, types.IpRange{CidrIp: sdk.String(c)})
+	}
+	g.IpPermissions = []types.IpPermission{perm}
+	return g
+}
+
+// launchInto runs one CreateInstance in ap-southeast-2a, collecting the
+// driver's warnings.
+func launchInto(t *testing.T, d *Driver) (*provider.Instance, []string, error) {
+	t.Helper()
+	var logs []string
+	d.Log = func(format string, a ...any) { logs = append(logs, fmt.Sprintf(format, a...)) }
+	in, err := d.CreateInstance(t.Context(), provider.CreateInstanceRequest{
+		Type: "g5.xlarge", Image: "ami-0abc", Name: "rig-train", Location: "ap-southeast-2a", SSHKeyIDs: []string{"k"},
+	})
+	return in, logs, err
+}
+
+func authorizedCIDRs(in *ec2.AuthorizeSecurityGroupIngressInput) []string {
+	var out []string
+	if in == nil {
+		return nil
+	}
+	for _, p := range in.IpPermissions {
+		for _, r := range p.IpRanges {
+			out = append(out, deref(r.CidrIp))
+		}
+		for _, r := range p.Ipv6Ranges {
+			out = append(out, deref(r.CidrIpv6))
+		}
+	}
+	return out
+}
+
+func TestSecurityGroupAdmitsOnlyTheOperatorIP(t *testing.T) {
+	// The group rig creates opened 22/tcp to 0.0.0.0/0, and once landed in
+	// a production VPC that way. By default it now admits one /32.
+	vpcs, subnets := defaultNetwork()
+	e := &fakeEC2{vpcs: vpcs, subnets: subnets}
+	d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+
+	if _, _, err := launchInto(t, d); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.authorizeCalls) != 1 {
+		t.Fatalf("AuthorizeSecurityGroupIngress called %d times, want 1", len(e.authorizeCalls))
+	}
+	if got := authorizedCIDRs(e.authorizeCalls[0]); len(got) != 1 || got[0] != testIP+"/32" {
+		t.Errorf("authorised %v, want only %s/32", got, testIP)
+	}
+	p := e.authorizeCalls[0].IpPermissions[0]
+	if deref(p.IpProtocol) != "tcp" || *p.FromPort != 22 || *p.ToPort != 22 {
+		t.Errorf("permission = %+v, want 22/tcp", p)
+	}
+	// Provenance and purpose, for whoever audits the VPC later.
+	if e.createdGroup == nil {
+		t.Fatal("no security group created")
+	}
+	desc := deref(e.createdGroup.Description)
+	if !strings.Contains(desc, "rig") || !strings.Contains(desc, "ssh") || !strings.Contains(desc, "github.com/dtuit/rig") {
+		t.Errorf("description = %q, want it to name rig, ssh and where the tool comes from", desc)
+	}
+	tags := map[string]string{}
+	for _, ts := range e.createdGroup.TagSpecifications {
+		for _, tg := range ts.Tags {
+			tags[deref(tg.Key)] = deref(tg.Value)
+		}
+	}
+	if tags["rig:managed"] != "true" || tags["Name"] != "rig" || tags["rig:purpose"] == "" {
+		t.Errorf("group tags = %v, want Name, rig:managed and a purpose", tags)
+	}
+}
+
+func TestConfiguredSSHCIDRsAreHonouredVerbatim(t *testing.T) {
+	vpcs, subnets := defaultNetwork()
+	e := &fakeEC2{vpcs: vpcs, subnets: subnets}
+	d := newTestDriverConfig(t, Config{SSHCIDRs: []string{"10.20.0.0/16", "0.0.0.0/0", "198.51.100.9"}}, e, &fakeSSM{}, &fakePricing{})
+	d.publicIP = func(context.Context) (netip.Addr, error) {
+		t.Error("discovered the public IP although ssh_cidrs is configured")
+		return netip.Addr{}, errors.New("must not be called")
+	}
+
+	if _, _, err := launchInto(t, d); err != nil {
+		t.Fatal(err)
+	}
+	got := authorizedCIDRs(e.authorizeCalls[0])
+	want := []string{"10.20.0.0/16", "0.0.0.0/0", "198.51.100.9/32"}
+	if len(got) != len(want) {
+		t.Fatalf("authorised %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("authorised %v, want %v (a bare address means /32, and 0.0.0.0/0 is honoured when asked for)", got, want)
+		}
+	}
+}
+
+func TestExistingRigGroupGainsTheCurrentIP(t *testing.T) {
+	// The operator moved networks: the group rig created still admits
+	// yesterday's address. rig adds today's rather than leaving an
+	// instance nobody can reach.
+	vpcs, subnets := defaultNetwork()
+	e := &fakeEC2{vpcs: vpcs, subnets: subnets, groups: []types.SecurityGroup{sgWith(true, "198.51.100.4/32")}}
+	d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+
+	_, logs, err := launchInto(t, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.createdGroup != nil {
+		t.Error("created a second group although the rig group exists")
+	}
+	if len(e.authorizeCalls) != 1 || deref(e.authorizeCalls[0].GroupId) != "sg-0old" {
+		t.Fatalf("authorize calls = %+v, want one against sg-0old", e.authorizeCalls)
+	}
+	if got := authorizedCIDRs(e.authorizeCalls[0]); len(got) != 1 || got[0] != testIP+"/32" {
+		t.Errorf("authorised %v, want only the current %s/32", got, testIP)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "sg-0old") || !strings.Contains(logs[0], testIP+"/32") {
+		t.Errorf("logs = %v, want one line naming the group and the address it added", logs)
+	}
+	if in := e.runIn; in == nil || in.NetworkInterfaces[0].Groups[0] != "sg-0old" {
+		t.Errorf("launch did not use the existing group: %+v", in)
+	}
+}
+
+func TestExistingRigGroupAlreadyAdmittingTheIPIsUntouched(t *testing.T) {
+	vpcs, subnets := defaultNetwork()
+	e := &fakeEC2{vpcs: vpcs, subnets: subnets, groups: []types.SecurityGroup{sgWith(true, "203.0.113.0/24")}}
+	d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+
+	_, logs, err := launchInto(t, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(e.authorizeCalls) != 0 {
+		t.Errorf("authorised %+v, want nothing: a /24 covering the address already admits it", e.authorizeCalls)
+	}
+	if len(logs) != 0 {
+		t.Errorf("logs = %v, want silence when the group already admits the operator", logs)
+	}
+}
+
+func TestRigGroupOpenToTheWorldIsFlagged(t *testing.T) {
+	// The group created before this change still holds 22/tcp from
+	// 0.0.0.0/0. It admits the operator, so nothing is added — but the
+	// rule is called out with the line that removes it.
+	vpcs, subnets := defaultNetwork()
+	e := &fakeEC2{vpcs: vpcs, subnets: subnets, groups: []types.SecurityGroup{sgWith(true, "0.0.0.0/0")}}
+	d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+
+	_, logs, err := launchInto(t, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(e.authorizeCalls) != 0 {
+		t.Errorf("authorised %+v, want nothing", e.authorizeCalls)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("logs = %v, want one warning about the open rule", logs)
+	}
+	for _, want := range []string{"0.0.0.0/0", "sg-0old", "revoke-security-group-ingress"} {
+		if !strings.Contains(logs[0], want) {
+			t.Errorf("warning = %q, want it to mention %q", logs[0], want)
+		}
+	}
+}
+
+func TestUnmanagedSecurityGroupIsNeverModified(t *testing.T) {
+	vpcs, subnets := defaultNetwork()
+	// Someone else's group of the same name, without the rig:managed tag.
+	e := &fakeEC2{vpcs: vpcs, subnets: subnets, groups: []types.SecurityGroup{sgWith(false, "198.51.100.4/32")}}
+	d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+
+	_, _, err := launchInto(t, d)
+	if err == nil {
+		t.Fatal("want an error: the group does not admit the operator and rig may not widen it")
+	}
+	for _, want := range []string{"sg-0old", testIP + "/32", "rig:managed", "authorize-security-group-ingress"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to mention %q", err, want)
+		}
+	}
+	if len(e.authorizeCalls) != 0 || e.createdGroup != nil {
+		t.Errorf("touched a group rig does not manage: authorize %+v created %+v", e.authorizeCalls, e.createdGroup)
+	}
+	if e.runIn != nil {
+		t.Error("launched an instance nobody could ssh into")
+	}
+
+	// The same group, already admitting the operator: rig launches into it
+	// and still changes nothing.
+	e = &fakeEC2{vpcs: vpcs, subnets: subnets, groups: []types.SecurityGroup{sgWith(false, "203.0.113.0/24")}}
+	d = newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+	if _, _, err := launchInto(t, d); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.authorizeCalls) != 0 {
+		t.Errorf("authorised %+v against an unmanaged group", e.authorizeCalls)
+	}
+	if e.runIn == nil || e.runIn.NetworkInterfaces[0].Groups[0] != "sg-0old" {
+		t.Errorf("launch did not use the unmanaged group it was pointed at: %+v", e.runIn)
+	}
+}
+
+func TestUndiscoverablePublicIPFailsNamingTheConfigKey(t *testing.T) {
+	// No fallback to 0.0.0.0/0: that is the failure mode being removed.
+	vpcs, subnets := defaultNetwork()
+	e := &fakeEC2{vpcs: vpcs, subnets: subnets}
+	d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+	d.publicIP = func(context.Context) (netip.Addr, error) {
+		return netip.Addr{}, errors.New("dial tcp: lookup checkip.amazonaws.com: no such host")
+	}
+
+	_, _, err := launchInto(t, d)
+	if err == nil {
+		t.Fatal("want an error when the operator's IP cannot be determined")
+	}
+	for _, want := range []string{"providers.aws.ssh_cidrs", "0.0.0.0/0", "no such host"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to mention %q", err, want)
+		}
+	}
+	if e.createdGroup != nil || len(e.authorizeCalls) != 0 || e.runIn != nil {
+		t.Error("created something although ssh could not be authorised")
 	}
 }
