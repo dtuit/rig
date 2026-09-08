@@ -158,3 +158,7 @@ last step.
 keys, live availability, balance); `internal/provider/verda` is ~300 lines
 against the official SDK. Everything above the interface — placement,
 volumes, TTL, jobs, TUI — is provider-agnostic.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
