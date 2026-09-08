@@ -157,12 +157,12 @@ func (m dashModel) View() string {
 		if i == m.cursor {
 			cursor = selStyle.Render("> ")
 		}
-		status := in.Status
+		status := string(in.Status)
 		switch in.Status {
-		case "running":
+		case provider.Running:
 			status = runStyle.Render(fmt.Sprintf("%-12s", status))
 			burn += in.PricePerHour
-		case "offline", "provisioning", "ordered":
+		case provider.Stopped, provider.Provisioning:
 			status = offStyle.Render(fmt.Sprintf("%-12s", status))
 		default:
 			status = fmt.Sprintf("%-12s", status)

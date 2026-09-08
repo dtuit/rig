@@ -4,6 +4,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,13 +28,17 @@ type App struct {
 	Log  func(format string, a ...any)
 }
 
+// Provider is the name of the cloud this App drives.
+func (a *App) Provider() string { return a.Prov.Name() }
+
 func (a *App) logf(format string, args ...any) {
 	if a.Log != nil {
 		a.Log(format, args...)
 	}
 }
 
-// Managed returns rig-managed instances (hostname prefix), newest first.
+// Managed returns rig-managed instances (hostname prefix), newest first,
+// each tagged with this App's provider.
 func (a *App) Managed(ctx context.Context) ([]provider.Instance, error) {
 	all, err := a.Prov.ListInstances(ctx)
 	if err != nil {
@@ -42,17 +47,26 @@ func (a *App) Managed(ctx context.Context) ([]provider.Instance, error) {
 	var out []provider.Instance
 	for _, in := range all {
 		if strings.HasPrefix(in.Name, HostPrefix) {
+			a.stamp(&in)
 			out = append(out, in)
 		}
 	}
 	slices.SortFunc(out, func(x, y provider.Instance) int {
 		return y.CreatedAt.Compare(x.CreatedAt)
 	})
-	// a fresh listing is the one moment stale cache entries can be caught
-	if err := instcache.Reconcile(instcache.Path(), out, time.Now()); err != nil {
+	// a fresh listing is the one moment stale cache entries can be caught —
+	// this provider's entries; the listing says nothing about other clouds'
+	if err := instcache.Reconcile(instcache.Path(), a.Prov.Name(), out, time.Now()); err != nil {
 		a.logf("warning: instance cache: %v", err)
 	}
 	return out, nil
+}
+
+// stamp tags in with the provider it came from. Drivers do not know rig's
+// name for them, so core does this wherever an instance enters: listings,
+// creates, and the instance a caller hands to Down.
+func (a *App) stamp(in *provider.Instance) {
+	in.Provider = a.Prov.Name()
 }
 
 // Resolve picks an instance by name/ID prefix; with empty key it returns the
@@ -73,12 +87,25 @@ func (a *App) Resolve(ctx context.Context, key string) (*provider.Instance, erro
 // cached answers key from the instance cache, or nil on a miss. Cache
 // trouble is a warning, never an error: the provider path still works.
 func (a *App) cached(key string) *provider.Instance {
+	return match(a.cachedInstances(), key)
+}
+
+// cachedInstances is this provider's slice of the instance cache: another
+// cloud's rig-train is not the one this App can reach. Cache trouble is a
+// warning and an empty answer.
+func (a *App) cachedInstances() []provider.Instance {
 	instances, err := instcache.Read(instcache.Path(), time.Now())
 	if err != nil {
 		a.logf("warning: instance cache: %v", err)
 		return nil
 	}
-	return match(instances, key)
+	mine := instances[:0]
+	for _, in := range instances {
+		if in.Provider == a.Prov.Name() {
+			mine = append(mine, in)
+		}
+	}
+	return mine
 }
 
 // match honours -i's contract: full hostname, short name, or ID prefix.
@@ -103,7 +130,7 @@ func (a *App) ResolveFresh(ctx context.Context, key string) (*provider.Instance,
 	if key == "" {
 		var running []provider.Instance
 		for _, in := range instances {
-			if in.Status == "running" {
+			if in.Status == provider.Running {
 				running = append(running, in)
 			}
 		}
@@ -121,15 +148,32 @@ func (a *App) ResolveFresh(ctx context.Context, key string) (*provider.Instance,
 		}
 	}
 	if in := match(instances, key); in != nil {
+		a.refreshCached(in)
 		return in, nil
 	}
 	return nil, fmt.Errorf("no rig instance matching %q", key)
 }
 
+// refreshCached rewrites in's cache entry when the endpoint it recorded is
+// no longer the one the provider reports — a container's host-mapped port
+// moves on restart — so the next cached resolve connects rather than failing
+// once. Managed's reconcile normally does this already; this covers the
+// entry it could not. Best-effort, like every cache write.
+func (a *App) refreshCached(in *provider.Instance) {
+	if old := match(a.cachedInstances(), in.Name); old != nil && old.SSH != in.SSH {
+		a.Remember(in)
+	}
+}
+
+// Target is the ssh endpoint for in: the host and port the provider reports
+// (falling back to the IP on the default port for a driver that fills none),
+// as the provider's login user unless config ssh.user overrides it — and
+// root when neither says.
 func (a *App) Target(in *provider.Instance) sshx.Target {
 	t := sshx.Target{
-		User:         a.Cfg.SSH.User,
-		Host:         in.IP,
+		User:         orDefault(a.Cfg.SSH.User, orDefault(in.SSH.User, "root")),
+		Host:         orDefault(in.SSH.Host, in.IP),
+		Port:         in.SSH.Port,
 		ForwardAgent: a.Cfg.ForwardAgent(),
 		IdentityFile: a.Cfg.IdentityFile(),
 	}
@@ -182,18 +226,26 @@ func SpecFromProfile(name string, p config.Profile) (UpSpec, error) {
 	}, nil
 }
 
-// Pick chooses (type, location) from the preference list against live
-// availability. Locations already holding the profile's volume win ties.
-func (a *App) Pick(ctx context.Context, spec UpSpec) (typ, loc string, err error) {
+// Candidate is one (type, location) pair Up may try, in preference order.
+type Candidate struct {
+	Type     string
+	Location string
+}
+
+// Pick ranks (type, location) pairs from the preference list against live
+// availability: types in profile order, then within a type the locations
+// already holding the profile's volume, then alphabetically. Up walks the
+// list in that order, moving on only when the provider reports no capacity.
+func (a *App) Pick(ctx context.Context, spec UpSpec) ([]Candidate, error) {
 	avail, err := a.Prov.Availability(ctx, spec.Spot)
 	if err != nil {
-		return "", "", fmt.Errorf("fetching availability: %w", err)
+		return nil, fmt.Errorf("fetching availability: %w", err)
 	}
 	volLocs := map[string]bool{}
 	if spec.Volume != nil {
 		vols, err := a.Prov.ListVolumes(ctx)
 		if err != nil {
-			return "", "", err
+			return nil, err
 		}
 		for _, v := range vols {
 			if v.Name == spec.Volume.Name {
@@ -201,20 +253,18 @@ func (a *App) Pick(ctx context.Context, spec UpSpec) (typ, loc string, err error
 			}
 		}
 	}
+	var out []Candidate
 	for _, t := range spec.Types {
-		var candidates []string
+		var locs []string
 		for l, types := range avail {
 			if spec.Location != "" && l != spec.Location {
 				continue
 			}
 			if slices.Contains(types, t) {
-				candidates = append(candidates, l)
+				locs = append(locs, l)
 			}
 		}
-		if len(candidates) == 0 {
-			continue
-		}
-		slices.SortFunc(candidates, func(x, y string) int {
+		slices.SortFunc(locs, func(x, y string) int {
 			if volLocs[x] != volLocs[y] {
 				if volLocs[x] {
 					return -1
@@ -223,13 +273,24 @@ func (a *App) Pick(ctx context.Context, spec UpSpec) (typ, loc string, err error
 			}
 			return strings.Compare(x, y)
 		})
-		return t, candidates[0], nil
+		for _, l := range locs {
+			out = append(out, Candidate{Type: t, Location: l})
+		}
 	}
+	if len(out) == 0 {
+		return nil, noneAvailable(spec)
+	}
+	return out, nil
+}
+
+// noneAvailable is the launch-failed answer when no candidate was offered or
+// every one turned out to have no capacity.
+func noneAvailable(spec UpSpec) error {
 	mode := "on-demand"
 	if spec.Spot {
 		mode = "spot"
 	}
-	return "", "", fmt.Errorf("none of %s available %s%s right now (rig types --available to see what is)",
+	return fmt.Errorf("none of %s available %s%s right now (rig types --available to see what is)",
 		strings.Join(spec.Types, ", "), mode, pinSuffix(spec.Location))
 }
 
@@ -275,8 +336,26 @@ func orDefault(s, d string) string {
 	return s
 }
 
-// Up runs the whole launch flow and returns the running, initialized instance.
-func (a *App) Up(ctx context.Context, spec UpSpec) (*provider.Instance, error) {
+// Provision is the provider half of Up: it refuses what the driver cannot
+// do, walks the candidate list until an instance is running with an IP, and
+// returns it untouched — no ssh, no footprint, no ledger or cache entry.
+func (a *App) Provision(ctx context.Context, spec UpSpec) (*provider.Instance, error) {
+	in, _, err := a.provision(ctx, spec)
+	return in, err
+}
+
+// provision also returns the data volume IDs attached at create so Up can
+// mount them; the instance's own VolumeIDs are provider-shaped and may
+// include the OS volume.
+func (a *App) provision(ctx context.Context, spec UpSpec) (*provider.Instance, []string, error) {
+	caps := a.Prov.Capabilities()
+	if spec.Spot && !caps.Spot {
+		return nil, nil, fmt.Errorf("%s does not offer spot instances: %w", a.Prov.Name(), provider.ErrUnsupported)
+	}
+	if spec.Volume != nil && !caps.Volumes {
+		return nil, nil, fmt.Errorf("%s does not offer data volumes: %w", a.Prov.Name(), provider.ErrUnsupported)
+	}
+
 	// --name rig-x would otherwise become rig-rig-x (issue 15)
 	if strings.HasPrefix(spec.Name, HostPrefix) {
 		spec.Name = strings.TrimPrefix(spec.Name, HostPrefix)
@@ -285,77 +364,125 @@ func (a *App) Up(ctx context.Context, spec UpSpec) (*provider.Instance, error) {
 	hostname := HostPrefix + spec.Name
 	existing, err := a.Managed(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, in := range existing {
-		if in.Name == hostname && in.Status != "discontinued" {
-			return nil, fmt.Errorf("instance %s already exists (%s); pick another --name", hostname, in.Status)
+		if in.Name == hostname && in.Status != provider.Gone {
+			return nil, nil, fmt.Errorf("instance %s already exists (%s); pick another --name", hostname, in.Status)
 		}
 	}
 
-	typ, loc, err := a.Pick(ctx, spec)
+	candidates, err := a.Pick(ctx, spec)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	a.logf("selected %s in %s (spot=%v)", typ, loc, spec.Spot)
-
-	image := spec.Image
-	if image == "" {
-		imgs, err := a.Prov.Images(ctx, typ)
-		if err != nil {
-			return nil, fmt.Errorf("listing images for %s: %w", typ, err)
-		}
-		for _, im := range imgs {
-			if im.Default {
-				image = im.Name
-				break
-			}
-		}
-		if image == "" && len(imgs) > 0 {
-			image = imgs[0].Name
-		}
-		if image == "" {
-			return nil, fmt.Errorf("no image available for %s; set image in config", typ)
-		}
-	}
-	a.logf("image: %s", image)
 
 	keyPath, pubkey, err := a.Cfg.PublicKey()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	user := os.Getenv("USER")
 	keyID, err := a.Prov.EnsureSSHKey(ctx, fmt.Sprintf("rig-%s-%s", user, filepath.Base(keyPath)), pubkey)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	var volumes []string
-	if spec.Volume != nil {
-		volID, err := a.EnsureVolume(ctx, spec.Volume, loc)
+	images := map[string]string{} // default image per type, looked up once
+	for _, c := range candidates {
+		a.logf("selected %s in %s (spot=%v)", c.Type, c.Location, spec.Spot)
+
+		image, err := a.imageFor(ctx, spec, c.Type, images)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		volumes = append(volumes, volID)
-	}
+		a.logf("image: %s", image)
 
-	a.logf("creating instance %s ...", hostname)
-	in, err := a.Prov.CreateInstance(ctx, provider.CreateInstanceRequest{
-		Type:            typ,
-		Image:           image,
-		Name:            hostname,
-		Description:     "managed by rig",
-		Location:        loc,
-		Spot:            spec.Spot,
-		SSHKeyIDs:       []string{keyID},
-		ExistingVolumes: volumes,
-		OSVolumeGB:      spec.OSGB,
-	})
+		var volumes []string
+		if spec.Volume != nil {
+			volID, err := a.EnsureVolume(ctx, spec.Volume, c.Location)
+			if err != nil {
+				return nil, nil, err
+			}
+			volumes = append(volumes, volID)
+		}
+
+		a.logf("creating instance %s ...", hostname)
+		in, err := a.Prov.CreateInstance(ctx, provider.CreateInstanceRequest{
+			Type:            c.Type,
+			Image:           image,
+			Name:            hostname,
+			Description:     "managed by rig",
+			Location:        c.Location,
+			Spot:            spec.Spot,
+			SSHKeyIDs:       []string{keyID},
+			ExistingVolumes: volumes,
+			OSVolumeGB:      spec.OSGB,
+		})
+		if err != nil {
+			if errors.Is(err, provider.ErrNoCapacity) {
+				a.logf("no capacity for %s in %s, trying next", c.Type, c.Location)
+				continue
+			}
+			return nil, nil, fmt.Errorf("create failed: %w", err)
+		}
+
+		in, err = a.waitRunning(ctx, in.ID, 20*time.Minute)
+		if err != nil {
+			if errors.Is(err, provider.ErrNoCapacity) {
+				a.logf("no capacity for %s in %s, trying next", c.Type, c.Location)
+				a.discard(ctx, in)
+				continue
+			}
+			return nil, nil, err
+		}
+		a.stamp(in)
+		return in, volumes, nil
+	}
+	return nil, nil, noneAvailable(spec)
+}
+
+// imageFor answers spec.Image, or the provider's default image for typ,
+// remembering the lookup in cache across the candidate walk.
+func (a *App) imageFor(ctx context.Context, spec UpSpec, typ string, cache map[string]string) (string, error) {
+	if spec.Image != "" {
+		return spec.Image, nil
+	}
+	if image, ok := cache[typ]; ok {
+		return image, nil
+	}
+	imgs, err := a.Prov.Images(ctx, typ)
 	if err != nil {
-		return nil, fmt.Errorf("create failed: %w", err)
+		return "", fmt.Errorf("listing images for %s: %w", typ, err)
 	}
+	image := ""
+	for _, im := range imgs {
+		if im.Default {
+			image = im.Name
+			break
+		}
+	}
+	if image == "" && len(imgs) > 0 {
+		image = imgs[0].Name
+	}
+	if image == "" {
+		return "", fmt.Errorf("no image available for %s; set image in config", typ)
+	}
+	cache[typ] = image
+	return image, nil
+}
 
-	in, err = a.waitRunning(ctx, in.ID, 20*time.Minute)
+// discard removes an instance that never became usable, taking its OS
+// volume with it as Down does. Best effort: the candidate walk goes on
+// whatever the provider says.
+func (a *App) discard(ctx context.Context, in *provider.Instance) {
+	if err := a.Prov.DeleteInstance(ctx, in.ID, volumesToDelete(in, false)); err != nil {
+		a.logf("warning: deleting %s (%s): %v", in.Name, in.ID, err)
+	}
+}
+
+// Up runs the whole launch flow and returns the running, initialized instance.
+func (a *App) Up(ctx context.Context, spec UpSpec) (*provider.Instance, error) {
+	in, volumes, err := a.provision(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
@@ -420,7 +547,7 @@ func isNotFound(err error) bool {
 
 func (a *App) waitRunning(ctx context.Context, id string, timeout time.Duration) (*provider.Instance, error) {
 	deadline := time.Now().Add(timeout)
-	last := ""
+	var last provider.Status
 	for time.Now().Before(deadline) {
 		in, err := a.Prov.GetInstance(ctx, id)
 		if err == nil {
@@ -429,11 +556,13 @@ func (a *App) waitRunning(ctx context.Context, id string, timeout time.Duration)
 				last = in.Status
 			}
 			switch in.Status {
-			case "running":
+			case provider.Running:
 				if in.IP != "" {
 					return in, nil
 				}
-			case "error", "discontinued", "no_capacity":
+			case provider.NoCapacity:
+				return in, fmt.Errorf("instance entered status %q: %w", in.Status, provider.ErrNoCapacity)
+			case provider.Error, provider.Gone:
 				return in, fmt.Errorf("instance entered status %q", in.Status)
 			}
 		}
@@ -472,18 +601,8 @@ func (a *App) MountVolume(ctx context.Context, t sshx.Target, volID string) erro
 // deleteVolumes. The returned event is the ledger record — lifetime and
 // cost — so callers report the same numbers the ledger keeps.
 func (a *App) Down(ctx context.Context, in *provider.Instance, deleteVolumes bool) (ledger.Event, error) {
-	volIDs := []string{}
-	if in.OSVolumeID != "" {
-		volIDs = append(volIDs, in.OSVolumeID)
-	}
-	if deleteVolumes {
-		for _, id := range in.VolumeIDs {
-			if id != in.OSVolumeID {
-				volIDs = append(volIDs, id)
-			}
-		}
-	}
-	if err := a.Prov.DeleteInstance(ctx, in.ID, volIDs); err != nil {
+	a.stamp(in) // the ledger event must say which cloud billed this
+	if err := a.Prov.DeleteInstance(ctx, in.ID, volumesToDelete(in, deleteVolumes)); err != nil {
 		if isNotFound(err) {
 			a.Forget(in) // the provider lost it first; the cache must not keep resolving to it
 		}
@@ -495,4 +614,21 @@ func (a *App) Down(ctx context.Context, in *provider.Instance, deleteVolumes boo
 		a.logf("warning: spend ledger: %v", err)
 	}
 	return ev, nil
+}
+
+// volumesToDelete lists what goes down with in: always its OS volume, plus
+// its data volumes when deleteVolumes.
+func volumesToDelete(in *provider.Instance, deleteVolumes bool) []string {
+	volIDs := []string{}
+	if in.OSVolumeID != "" {
+		volIDs = append(volIDs, in.OSVolumeID)
+	}
+	if deleteVolumes {
+		for _, id := range in.VolumeIDs {
+			if id != in.OSVolumeID {
+				volIDs = append(volIDs, id)
+			}
+		}
+	}
+	return volIDs
 }

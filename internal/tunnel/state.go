@@ -24,12 +24,18 @@ type Forward struct {
 func (f Forward) pair() [2]int { return [2]int{f.Local, f.Remote} }
 
 // Endpoint identifies the instance a tunnel connects to, pinned at ensure
-// time. Ensure treats a recorded Endpoint whose ID or IP no longer matches
-// the resolved instance as a tunnel to a recycled address and replaces it.
+// time. Ensure treats a recorded Endpoint whose ID, host, port or user no
+// longer matches the resolved instance as a tunnel to a recycled address (or
+// a container whose mapped port moved) and replaces it. User is the ssh
+// login the ensure side resolved (provider default or config override);
+// empty means the supervisor falls back to config and root, as it did before
+// the field existed.
 type Endpoint struct {
 	Instance string `json:"instance"` // full rig- hostname
 	ID       string `json:"id"`       // provider instance ID
-	IP       string `json:"ip"`
+	IP       string `json:"ip"`       // ssh host: the instance IP, or a proxy host
+	Port     int    `json:"port,omitempty"`
+	User     string `json:"user,omitempty"`
 }
 
 // Phase is a tunnel's lifecycle stage. Issue 05 adds "reconnecting" between

@@ -213,10 +213,22 @@ func newConfigCmd() *cobra.Command {
 	}
 }
 
-const exampleConfig = `provider: verda
+const exampleConfig = `provider: verda                        # default; profiles may pin their own, --provider overrides
 credentials_file: ~/secrets/verda.env  # or set VERDA_CLIENT_ID/SECRET
+providers:                             # per-provider blocks; env vars always win over credentials_file
+  verda:
+    credentials_file: ~/secrets/verda.env  # same as the top-level line above
+  runpod:
+    credentials_file: ~/secrets/runpod.env # RUNPOD_API_KEY (or RUNPOD_KEY)
+    cloud: secure                          # or community
+  vast:
+    credentials_file: ~/secrets/vast.env   # VAST_API_KEY
+    min_reliability: 0.95
+  aws:
+    profile: default                       # SDK credential chain; AWS_PROFILE also honoured
+    region: ap-southeast-2
 ssh:
-  user: root
+  user: root                           # optional override of the provider's login user
   public_key: ~/.ssh/id_ed25519.pub
   forward_agent: true
 defaults:
@@ -235,4 +247,7 @@ profiles:
   cheap:
     types: [1A6000.10V, 1L40S.20V]
     spot: true
+  pod:
+    provider: runpod                    # pin this profile to another cloud
+    types: [1xA100-SXM]
 `

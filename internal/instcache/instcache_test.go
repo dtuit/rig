@@ -126,7 +126,7 @@ func TestReconcile(t *testing.T) {
 		// id-3 gone from the provider entirely: drop
 	}
 	later := t0.Add(MaxAge - time.Minute)
-	if err := Reconcile(path, live, later); err != nil {
+	if err := Reconcile(path, "verda", live, later); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := Read(path, later)
@@ -181,5 +181,61 @@ func TestConcurrentSaves(t *testing.T) {
 	left, _ := filepath.Glob(filepath.Join(filepath.Dir(path), "*.tmp"))
 	if len(left) != 0 {
 		t.Errorf("temp files left behind: %v", left)
+	}
+}
+
+// A cache written before entries carried a provider is Verda's: its entries
+// read back as verda, so nothing distinguishes an upgraded file from a fresh
+// one.
+func TestOldEntryReadsAsVerda(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "instances.json")
+	old := `[{"id":"id-1","name":"rig-a","type":"1H100.80S.30V","status":"running","ip":"10.0.0.1","cached_at":"2026-09-06T10:00:00Z"}]`
+	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Read(path, t0.Add(time.Minute))
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Read = %v, %v; want the one old entry", got, err)
+	}
+	if got[0].Provider != "verda" {
+		t.Errorf("Provider = %q, want verda for an entry without one", got[0].Provider)
+	}
+}
+
+// Two clouds may both hold a rig-train: the cache keeps one entry per
+// provider, and a listing from one provider never touches the other's
+// entries — an empty RunPod listing drops RunPod's stale entry and nothing
+// else.
+func TestReconcileTouchesOnlyTheActiveProvider(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "instances.json")
+	verda := inst("v-1", "rig-train", "10.0.0.1")
+	verda.Provider = "verda"
+	pod := inst("p-1", "rig-train", "1.2.3.4")
+	pod.Provider = "runpod"
+	for _, in := range []provider.Instance{verda, pod} {
+		if err := Put(path, in, t0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := Read(path, t0)
+	if len(got) != 2 {
+		t.Fatalf("Put of a same-named instance on another provider must not evict: %v", names(got))
+	}
+
+	if err := Reconcile(path, "runpod", nil, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = Read(path, t0.Add(time.Minute))
+	if len(got) != 1 || got[0].ID != "v-1" || got[0].Provider != "verda" {
+		t.Fatalf("after an empty runpod listing = %+v, want only the verda entry", got)
+	}
+
+	moved := inst("v-1", "rig-train", "10.0.0.7")
+	if err := Reconcile(path, "verda", []provider.Instance{moved}, t0.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = Read(path, t0.Add(2*time.Minute))
+	if len(got) != 1 || got[0].IP != "10.0.0.7" || got[0].Provider != "verda" {
+		t.Errorf("verda reconcile = %+v, want the refreshed verda entry, still tagged verda", got)
 	}
 }

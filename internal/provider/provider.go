@@ -4,15 +4,70 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
+// Status is an instance lifecycle state normalised across providers. Drivers
+// map their own vocabulary onto it; core, tui and cli compare only these
+// constants. The values are the lowercase words `--json` emits (ADR-0002).
+type Status string
+
+const (
+	Provisioning Status = "provisioning" // ordered or booting, no IP yet
+	Running      Status = "running"
+	Stopped      Status = "stopped"     // shut down, still billed for storage
+	Error        Status = "error"       // the provider gave up on it
+	Gone         Status = "gone"        // deleted or being deleted
+	NoCapacity   Status = "no_capacity" // ordered but the provider found no hardware
+)
+
+// ErrNoCapacity is wrapped by CreateInstance when the provider has no
+// hardware for the requested type in the requested location right now; core
+// moves on to the next candidate. Every other create error aborts the launch.
+var ErrNoCapacity = errors.New("no capacity")
+
+// ErrUnsupported is wrapped by drivers for a feature the cloud lacks (spot,
+// volumes, balance). Core refuses such requests up front via Capabilities and
+// callers hide what they cannot show.
+var ErrUnsupported = errors.New("unsupported by provider")
+
+// Capabilities reports which optional features a driver implements, so core
+// can refuse a request it knows the cloud cannot honour before spending a
+// call on it.
+type Capabilities struct {
+	Spot    bool // spot-priced instances
+	Volumes bool // persistent data volumes
+	Balance bool // account balance query
+}
+
+// Endpoint is where an instance's sshd answers. VMs report their IP on port
+// 22; a container reports its host-mapped port or a proxy host, and a
+// provider whose images log in as a non-root user says so in User. Config
+// ssh.user, when set, overrides User.
+type Endpoint struct {
+	Host string `json:"host"`
+	Port int    `json:"port"`
+	User string `json:"user"`
+}
+
+// Instance is a provider VM as rig sees it. Status is one of the Status
+// constants (an unknown provider state is passed through verbatim);
+// RawStatus keeps the provider's own status text for display and debugging.
+// IP is for display; SSH is what commands connect to. Provider is the name
+// of the cloud the instance lives on, stamped by core (not by drivers) so
+// local state — the instance cache, the ledger — can tell two clouds' rig-
+// instances apart; empty in a record written before the field existed means
+// verda.
 type Instance struct {
 	ID           string    `json:"id"`
 	Name         string    `json:"name"` // hostname
+	Provider     string    `json:"provider,omitempty"`
 	Type         string    `json:"type"`
-	Status       string    `json:"status"`
+	Status       Status    `json:"status"`
+	RawStatus    string    `json:"raw_status,omitempty"`
 	IP           string    `json:"ip"`
+	SSH          Endpoint  `json:"ssh"`
 	Location     string    `json:"location"`
 	Spot         bool      `json:"spot"`
 	PricePerHour float64   `json:"price_per_hour"`
@@ -82,6 +137,7 @@ type CreateVolumeRequest struct {
 
 type Provider interface {
 	Name() string
+	Capabilities() Capabilities
 
 	Locations(ctx context.Context) ([]Location, error)
 	InstanceTypes(ctx context.Context) ([]InstanceType, error)

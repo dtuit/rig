@@ -130,7 +130,9 @@ output shows only on a terminal running a single stream; `--quiet` drops it,
   and `adopt`, cleared on `down`, entries trusted for 12h, so `ssh`, `run`,
   `logs`, `wait`, `sync` and friends resolve a named instance without a provider
   call. `status`, `down`, `extend` and `adopt` always ask the provider, and any
-  fresh listing drops entries that have gone stale.
+  fresh listing drops entries that have gone stale and refreshes the cached ssh
+  endpoint (host, port, user) of the rest — so a container whose mapped port
+  moved on restart is reachable again after one such command.
 
 ## Agent orchestration
 

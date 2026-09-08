@@ -124,7 +124,8 @@ with "rig tunnel stop"; state and logs live beside rig's config.`,
 				for _, f := range forwards {
 					fwds = append(fwds, tunnel.Forward{Local: f[0], Remote: f[1]})
 				}
-				ep := tunnel.Endpoint{Instance: in.Name, ID: in.ID, IP: in.IP}
+				t := a.Target(in)
+				ep := tunnel.Endpoint{Instance: in.Name, ID: in.ID, IP: t.Host, Port: t.Port, User: t.User}
 				st, already, err := m.Ensure(ep, fwds)
 				if err != nil {
 					return err
@@ -189,7 +190,7 @@ func renderTunnels(states []tunnel.State) error {
 	fmt.Fprintln(w, "INSTANCE\tIP\tFORWARDS\tPHASE\tPID\tAGE")
 	for _, st := range states {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n",
-			strings.TrimPrefix(st.Instance, core.HostPrefix), st.IP,
+			strings.TrimPrefix(st.Instance, core.HostPrefix), hostPort(st.IP, st.Port),
 			forwardsDesc(st), st.Phase, st.PID, age(st.StartedAt))
 	}
 	return w.Flush()
@@ -299,8 +300,8 @@ func stopTunnelsBestEffort(name string) {
 
 // newTunnelSuperviseCmd is the hidden supervisor entry point --detach
 // re-execs (tunnel.Launcher). It rebuilds the ssh target from config alone —
-// the state carries the pinned IP, so no provider call or credentials are
-// needed.
+// the state carries the pinned host, port and login user, so no provider
+// call or credentials are needed.
 func newTunnelSuperviseCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:    tunnel.SuperviseCommand + " <state-json>",
@@ -316,7 +317,8 @@ func newTunnelSuperviseCmd() *cobra.Command {
 				return err
 			}
 			a := &core.App{Cfg: cfg, Log: stderrLogf}
-			return tunnel.Supervise(tunnel.Dir(), st, a.Target(&provider.Instance{IP: st.IP}))
+			in := &provider.Instance{IP: st.IP, SSH: provider.Endpoint{Host: st.IP, Port: st.Port, User: st.User}}
+			return tunnel.Supervise(tunnel.Dir(), st, a.Target(in))
 		},
 	}
 }

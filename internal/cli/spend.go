@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"sort"
 	"text/tabwriter"
 	"time"
 
@@ -37,8 +38,20 @@ marked with ~.`,
 				fmt.Println("no spend recorded")
 				return nil
 			}
+			// one cloud in the window: today's table; several: each row
+			// names its cloud and each cloud gets a subtotal, so a RunPod
+			// pod's cost is never read as Verda's
+			subtotals := map[string]float64{}
+			for _, l := range lines {
+				subtotals[l.Provider] += l.Cost
+			}
+			several := len(subtotals) > 1
 			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "NAME\tTYPE\tSTARTED\tHOURS\tCOST")
+			if several {
+				fmt.Fprintln(w, "NAME\tPROVIDER\tTYPE\tSTARTED\tHOURS\tCOST")
+			} else {
+				fmt.Fprintln(w, "NAME\tTYPE\tSTARTED\tHOURS\tCOST")
+			}
 			estimated := false
 			for _, l := range lines {
 				marker := ""
@@ -46,8 +59,12 @@ marked with ~.`,
 					marker = "~"
 					estimated = true
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%.1f\t%s$%.2f\n",
-					l.Name, l.Type, l.StartedAt.Local().Format("Jan 02 15:04"), l.Hours, marker, l.Cost)
+				prov := ""
+				if several {
+					prov = l.Provider + "\t"
+				}
+				fmt.Fprintf(w, "%s\t%s%s\t%s\t%.1f\t%s$%.2f\n",
+					l.Name, prov, l.Type, l.StartedAt.Local().Format("Jan 02 15:04"), l.Hours, marker, l.Cost)
 			}
 			w.Flush()
 			// issue 17: explain the ~ marker only when a row carries it.
@@ -55,7 +72,18 @@ marked with ~.`,
 			if estimated {
 				legend = " (~ = estimated: no down event, likely TTL teardown)"
 			}
-			fmt.Printf("\ntotal: $%.2f%s\n", total, legend)
+			fmt.Println()
+			if several {
+				provs := make([]string, 0, len(subtotals))
+				for p := range subtotals {
+					provs = append(provs, p)
+				}
+				sort.Strings(provs)
+				for _, p := range provs {
+					fmt.Printf("%s: $%.2f\n", p, subtotals[p])
+				}
+			}
+			fmt.Printf("total: $%.2f%s\n", total, legend)
 			return nil
 		},
 	}

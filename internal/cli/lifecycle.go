@@ -35,17 +35,27 @@ func newUpCmd() *cobra.Command {
 		Short: "Create an instance (interactive picker without a profile)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			a, err := newApp()
+			// a profile may pin its provider, so it is resolved before the app
+			var (
+				cfg  *config.Config
+				prof config.Profile
+			)
+			if len(args) == 1 {
+				var err error
+				if cfg, err = config.Load(); err != nil {
+					return err
+				}
+				if prof, err = cfg.Profile(args[0]); err != nil {
+					return err
+				}
+			}
+			a, err := newAppFor(cfg, prof.Provider)
 			if err != nil {
 				return err
 			}
 			var spec core.UpSpec
 			switch {
 			case len(args) == 1:
-				prof, err := a.Cfg.Profile(args[0])
-				if err != nil {
-					return err
-				}
 				spec, err = core.SpecFromProfile(args[0], prof)
 				if err != nil {
 					return err
@@ -130,7 +140,7 @@ func newDownCmd() *cobra.Command {
 					return err
 				}
 				for _, in := range instances {
-					if in.Status != "discontinued" && in.Status != "deleting" {
+					if in.Status != provider.Gone {
 						targets = append(targets, in.Name)
 					}
 				}
@@ -283,7 +293,7 @@ func newStatusCmd() *cobra.Command {
 			rows := make([]statusRow, 0, len(instances))
 			for _, in := range instances {
 				ttl := "-"
-				if in.Status == "running" && in.IP != "" {
+				if in.Status == provider.Running && in.IP != "" {
 					if dl, err := remote.Deadline(a.Target(&in)); err == nil {
 						ttl = time.Until(dl).Round(time.Minute).String()
 					}
@@ -297,18 +307,29 @@ func newStatusCmd() *cobra.Command {
 				fmt.Println("no rig instances")
 				return nil
 			}
+			// the provider column earns its place only once the config
+			// knows more than one cloud
+			several := len(a.Cfg.Providers) > 1
 			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "NAME\tSTATUS\tTYPE\tIP\tLOC\t$/H\tAGE\tTTL")
+			if several {
+				fmt.Fprintln(w, "NAME\tPROVIDER\tSTATUS\tTYPE\tIP\tLOC\t$/H\tAGE\tTTL")
+			} else {
+				fmt.Fprintln(w, "NAME\tSTATUS\tTYPE\tIP\tLOC\t$/H\tAGE\tTTL")
+			}
 			var burn float64
 			for _, r := range rows {
 				in := r.Instance
 				price := fmt.Sprintf("%.2f%s", in.PricePerHour, spotTag(in.Spot))
-				if in.Status == "running" {
+				if in.Status == provider.Running {
 					burn += in.PricePerHour
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					strings.TrimPrefix(in.Name, core.HostPrefix), in.Status, in.Type,
-					in.IP, in.Location, price, age(in.CreatedAt), r.TTL)
+				prov := ""
+				if several {
+					prov = in.Provider + "\t"
+				}
+				fmt.Fprintf(w, "%s\t%s%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					strings.TrimPrefix(in.Name, core.HostPrefix), prov, in.Status, in.Type,
+					hostPort(orIP(in), in.SSH.Port), in.Location, price, age(in.CreatedAt), r.TTL)
 			}
 			w.Flush()
 			if burn > 0 {
@@ -318,6 +339,14 @@ func newStatusCmd() *cobra.Command {
 		},
 	}
 	return cmd
+}
+
+// orIP is the ssh host for display, or the IP for a driver that fills none.
+func orIP(in provider.Instance) string {
+	if in.SSH.Host != "" {
+		return in.SSH.Host
+	}
+	return in.IP
 }
 
 func spotTag(spot bool) string {

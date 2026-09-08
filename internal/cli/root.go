@@ -10,29 +10,54 @@ import (
 
 	"github.com/dtuit/rig/internal/config"
 	"github.com/dtuit/rig/internal/core"
-	"github.com/dtuit/rig/internal/provider/verda"
+	"github.com/dtuit/rig/internal/provider"
 	"github.com/dtuit/rig/internal/tui"
+
+	// drivers register themselves with the provider registry on import
+	_ "github.com/dtuit/rig/internal/provider/verda"
 )
 
 var (
 	app          *core.App
 	instanceFlag string
 	jsonFlag     bool
+	providerFlag string
 )
 
+// newApp builds the App for commands that know no profile: the provider is
+// --provider, else config provider:, else verda.
 func newApp() (*core.App, error) {
+	return newAppFor(nil, "")
+}
+
+// newAppFor builds the App with a profile's provider pin in the running
+// order: --provider → pin → config provider: → verda. cfg may be nil, in
+// which case it is loaded; up passes the config it already resolved the
+// profile from.
+func newAppFor(cfg *config.Config, pin string) (*core.App, error) {
 	if app != nil {
 		return app, nil
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return nil, err
+	if cfg == nil {
+		var err error
+		if cfg, err = config.Load(); err != nil {
+			return nil, err
+		}
 	}
-	id, secret, err := cfg.Credentials()
-	if err != nil {
-		return nil, err
+	name := cfg.Provider
+	switch {
+	case providerFlag != "":
+		if pin != "" && pin != providerFlag {
+			stderrLogf("--provider %s overrides profile pin %s", providerFlag, pin)
+		}
+		name = providerFlag
+	case pin != "":
+		name = pin
 	}
-	prov, err := verda.New(id, secret)
+	if name == "" {
+		name = "verda"
+	}
+	prov, err := provider.Open(name, cfg.ProviderConfig(name))
 	if err != nil {
 		return nil, err
 	}
@@ -61,6 +86,7 @@ func NewRoot() *cobra.Command {
 		},
 	}
 	root.PersistentFlags().StringVarP(&instanceFlag, "instance", "i", "", "target instance name or ID prefix")
+	root.PersistentFlags().StringVar(&providerFlag, "provider", "", "cloud provider to drive (default: profile pin, then config provider:, then verda)")
 	root.PersistentFlags().BoolVar(&jsonFlag, "json", false, "machine-readable output (status, ps, types, volumes, spend, tunnel status)")
 
 	root.AddCommand(

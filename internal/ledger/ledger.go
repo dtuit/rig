@@ -17,11 +17,19 @@ import (
 	"github.com/dtuit/rig/internal/provider"
 )
 
+// DefaultProvider is the provider an event recorded before events carried one
+// belongs to: every ledger written by a single-provider rig was Verda's.
+const DefaultProvider = "verda"
+
+// Event is one lifecycle record. Provider names the cloud the instance was
+// on; Read fills it in for older records (see DefaultProvider), so callers
+// never see it empty.
 type Event struct {
 	Event        string    `json:"event"` // "up" | "extend" | "down"
 	Time         time.Time `json:"time"`
 	ID           string    `json:"id"`
 	Name         string    `json:"name"`
+	Provider     string    `json:"provider,omitempty"`
 	Type         string    `json:"type"`
 	Location     string    `json:"location"`
 	Spot         bool      `json:"spot"`
@@ -40,7 +48,7 @@ func Path() string {
 // UpEvent records an instance launch.
 func UpEvent(in *provider.Instance, ttl time.Duration, now time.Time) Event {
 	return Event{
-		Event: "up", Time: now, ID: in.ID, Name: in.Name, Type: in.Type,
+		Event: "up", Time: now, ID: in.ID, Name: in.Name, Provider: in.Provider, Type: in.Type,
 		Location: in.Location, Spot: in.Spot, PricePerHour: in.PricePerHour,
 		TTL: ttl.String(),
 	}
@@ -50,7 +58,7 @@ func UpEvent(in *provider.Instance, ttl time.Duration, now time.Time) Event {
 // estimate reaches the extended deadline instead of stopping at the up TTL.
 func ExtendEvent(in *provider.Instance, deadline, now time.Time) Event {
 	return Event{
-		Event: "extend", Time: now, ID: in.ID, Name: in.Name, Type: in.Type,
+		Event: "extend", Time: now, ID: in.ID, Name: in.Name, Provider: in.Provider, Type: in.Type,
 		Location: in.Location, Spot: in.Spot, PricePerHour: in.PricePerHour,
 		Deadline: deadline,
 	}
@@ -60,7 +68,7 @@ func ExtendEvent(in *provider.Instance, deadline, now time.Time) Event {
 func DownEvent(in *provider.Instance, now time.Time) Event {
 	lifetime := now.Sub(in.CreatedAt)
 	return Event{
-		Event: "down", Time: now, ID: in.ID, Name: in.Name, Type: in.Type,
+		Event: "down", Time: now, ID: in.ID, Name: in.Name, Provider: in.Provider, Type: in.Type,
 		Location: in.Location, Spot: in.Spot, PricePerHour: in.PricePerHour,
 		LifetimeSecs: int64(lifetime.Seconds()),
 		Cost:         lifetime.Hours() * in.PricePerHour,
@@ -84,7 +92,9 @@ func Append(path string, e Event) error {
 	return err
 }
 
-// Read returns all events; a missing ledger is empty, not an error.
+// Read returns all events, each with its Provider filled (DefaultProvider for
+// records written before the field existed); a missing ledger is empty, not
+// an error.
 func Read(path string) ([]Event, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -104,6 +114,9 @@ func Read(path string) ([]Event, error) {
 		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
 			continue // a corrupt line loses one record, not the ledger
 		}
+		if e.Provider == "" {
+			e.Provider = DefaultProvider
+		}
 		events = append(events, e)
 	}
 	return events, sc.Err()
@@ -112,6 +125,7 @@ func Read(path string) ([]Event, error) {
 // Line is one instance's spend within a summary window.
 type Line struct {
 	Name      string    `json:"name"`
+	Provider  string    `json:"provider,omitempty"`
 	Type      string    `json:"type"`
 	StartedAt time.Time `json:"started_at"`
 	Hours     float64   `json:"hours"`
@@ -147,7 +161,7 @@ func Summarize(events []Event, since, now time.Time) ([]Line, float64) {
 				start = up.Time
 			}
 			lines = append(lines, Line{
-				Name: e.Name, Type: e.Type, StartedAt: start,
+				Name: e.Name, Provider: e.Provider, Type: e.Type, StartedAt: start,
 				Hours: float64(e.LifetimeSecs) / 3600, Cost: e.Cost, Closed: true,
 			})
 		}
@@ -171,7 +185,7 @@ func Summarize(events []Event, since, now time.Time) ([]Line, float64) {
 		}
 		hours := end.Sub(up.Time).Hours()
 		lines = append(lines, Line{
-			Name: up.Name, Type: up.Type, StartedAt: up.Time,
+			Name: up.Name, Provider: up.Provider, Type: up.Type, StartedAt: up.Time,
 			Hours: hours, Cost: hours * up.PricePerHour, Estimated: true,
 		})
 	}

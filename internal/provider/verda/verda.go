@@ -9,8 +9,23 @@ import (
 
 	sdk "github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
 
+	"github.com/dtuit/rig/internal/config"
 	"github.com/dtuit/rig/internal/provider"
 )
+
+// envNames are the credential variables Verda needs, in the order they are
+// named in errors.
+var envNames = []string{"VERDA_CLIENT_ID", "VERDA_CLIENT_SECRET"}
+
+func init() {
+	provider.Register("verda", func(cfg config.ProviderConfig) (provider.Provider, error) {
+		creds, err := cfg.Creds(envNames)
+		if err != nil {
+			return nil, err
+		}
+		return New(creds["VERDA_CLIENT_ID"], creds["VERDA_CLIENT_SECRET"])
+	})
+}
 
 type Driver struct {
 	client *sdk.Client
@@ -28,6 +43,10 @@ func New(clientID, clientSecret string) (*Driver, error) {
 }
 
 func (d *Driver) Name() string { return "verda" }
+
+func (d *Driver) Capabilities() provider.Capabilities {
+	return provider.Capabilities{Spot: true, Volumes: true, Balance: true}
+}
 
 func (d *Driver) Locations(ctx context.Context) ([]provider.Location, error) {
 	locs, err := d.client.Locations.Get(ctx)
@@ -243,8 +262,10 @@ func fromSDKInstance(in *sdk.Instance) provider.Instance {
 		ID:           in.ID,
 		Name:         in.Hostname,
 		Type:         in.InstanceType,
-		Status:       in.Status,
+		Status:       fromSDKStatus(in.Status),
+		RawStatus:    in.Status,
 		IP:           ip,
+		SSH:          provider.Endpoint{Host: ip, Port: 22, User: "root"},
 		Location:     in.Location,
 		Spot:         in.IsSpot,
 		PricePerHour: float64(in.PricePerHour),
@@ -254,6 +275,26 @@ func fromSDKInstance(in *sdk.Instance) provider.Instance {
 		GPU:          in.GPU.Description,
 		Image:        in.Image,
 	}
+}
+
+// fromSDKStatus maps Verda's instance status words onto provider.Status; a
+// word this driver has never seen is passed through so it still shows up.
+func fromSDKStatus(raw string) provider.Status {
+	switch raw {
+	case "running":
+		return provider.Running
+	case "offline":
+		return provider.Stopped
+	case "provisioning", "ordered":
+		return provider.Provisioning
+	case "discontinued", "deleting":
+		return provider.Gone
+	case "error":
+		return provider.Error
+	case "no_capacity":
+		return provider.NoCapacity
+	}
+	return provider.Status(raw)
 }
 
 func fromSDKVolume(v *sdk.Volume) provider.Volume {

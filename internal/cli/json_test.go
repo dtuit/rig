@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,9 @@ type fakeProvider struct {
 }
 
 func (f *fakeProvider) Name() string { return "fake" }
+func (f *fakeProvider) Capabilities() provider.Capabilities {
+	return provider.Capabilities{Spot: true, Volumes: true, Balance: true}
+}
 func (f *fakeProvider) Locations(context.Context) ([]provider.Location, error) {
 	return nil, fmt.Errorf("not implemented")
 }
@@ -81,8 +85,14 @@ func (f *fakeProvider) Balance(context.Context) (float64, string, error) {
 // runRig executes the CLI with a fake provider installed and returns stdout.
 func runRig(t *testing.T, prov provider.Provider, args ...string) string {
 	t.Helper()
+	return runRigCfg(t, &config.Config{}, prov, args...)
+}
+
+// runRigCfg is runRig with the loaded config chosen by the caller.
+func runRigCfg(t *testing.T, cfg *config.Config, prov provider.Provider, args ...string) string {
+	t.Helper()
 	prevApp := app
-	app = &core.App{Cfg: &config.Config{}, Prov: prov}
+	app = &core.App{Cfg: cfg, Prov: prov}
 	defer func() { app = prevApp; jsonFlag = false }()
 
 	r, w, err := os.Pipe()
@@ -126,6 +136,9 @@ func TestStatusJSON(t *testing.T) {
 	}
 	if rows[0]["price_per_hour"] != 2.4 {
 		t.Errorf(`price_per_hour = %v, want 2.4`, rows[0]["price_per_hour"])
+	}
+	if rows[0]["provider"] != "fake" {
+		t.Errorf(`provider = %v, want "fake" (stamped by core, not the driver)`, rows[0]["provider"])
 	}
 }
 
@@ -175,5 +188,65 @@ func TestStatusTableUnchangedWithoutJSON(t *testing.T) {
 	out := runRig(t, &fakeProvider{}, "status")
 	if out != "no rig instances\n" {
 		t.Errorf("table output changed: %q", out)
+	}
+}
+
+// The IP column names the ssh endpoint when it is not the plain IP on 22 —
+// a container's mapped port — and stays the bare IP otherwise. Stopped, so
+// the TTL probe does not ssh anywhere.
+func TestStatusTableShowsHostPortWhenNotDefault(t *testing.T) {
+	prov := &fakeProvider{instances: []provider.Instance{
+		{ID: "pod1", Name: "rig-pod", Type: "1xA100-SXM", Status: provider.Stopped, IP: "1.2.3.4",
+			SSH: provider.Endpoint{Host: "1.2.3.4", Port: 10341, User: "root"}, Location: "US-TX-3", CreatedAt: time.Now()},
+		{ID: "vm1", Name: "rig-train", Type: "1H100.80S.32V", Status: provider.Stopped, IP: "10.0.0.5",
+			SSH: provider.Endpoint{Host: "10.0.0.5", Port: 22, User: "root"}, Location: "FIN-01", CreatedAt: time.Now()},
+	}}
+	out := runRig(t, prov, "status")
+	for _, want := range []string{"1.2.3.4:10341", "  10.0.0.5  "} {
+		if !strings.Contains(out, want) {
+			t.Errorf("table missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "10.0.0.5:22") {
+		t.Errorf("port 22 must not be shown:\n%s", out)
+	}
+
+	out = runRig(t, prov, "status", "--json")
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, out)
+	}
+	var pod map[string]any
+	for _, r := range rows {
+		if r["name"] == "rig-pod" {
+			pod = r
+		}
+	}
+	ssh, ok := pod["ssh"].(map[string]any)
+	if !ok || ssh["host"] != "1.2.3.4" || ssh["port"] != float64(10341) || ssh["user"] != "root" {
+		t.Errorf(`ssh = %v, want {"host":"1.2.3.4","port":10341,"user":"root"}`, pod["ssh"])
+	}
+}
+
+// The provider column earns its place only when the config knows more than
+// one cloud; a single-provider config's table keeps today's columns.
+func TestStatusTableProviderColumnOnlyWithSeveralProviders(t *testing.T) {
+	prov := &fakeProvider{instances: []provider.Instance{{
+		ID: "vm1", Name: "rig-train", Type: "1H100.80S.32V", Status: provider.Stopped, IP: "10.0.0.5",
+		SSH: provider.Endpoint{Host: "10.0.0.5", Port: 22, User: "root"}, Location: "FIN-01", CreatedAt: time.Now(),
+	}}}
+	one := &config.Config{Providers: map[string]config.ProviderConfig{"verda": {}}}
+	out := runRigCfg(t, one, prov, "status")
+	if !strings.HasPrefix(out, "NAME   STATUS   TYPE") || strings.Contains(out, "PROVIDER") {
+		t.Errorf("single-provider table changed:\n%s", out)
+	}
+
+	two := &config.Config{Providers: map[string]config.ProviderConfig{"verda": {}, "runpod": {}}}
+	out = runRigCfg(t, two, prov, "status")
+	if !strings.HasPrefix(out, "NAME   PROVIDER  STATUS   TYPE") {
+		t.Errorf("two-provider table lacks the PROVIDER column after NAME:\n%s", out)
+	}
+	if !strings.Contains(out, "train  fake      stopped") {
+		t.Errorf("row lacks the provider:\n%s", out)
 	}
 }

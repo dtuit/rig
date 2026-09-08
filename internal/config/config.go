@@ -17,7 +17,7 @@ type Agent struct {
 }
 
 type SSH struct {
-	User         string `yaml:"user"`
+	User         string `yaml:"user"` // overrides the provider's login user; empty = provider default (root on Verda)
 	PublicKey    string `yaml:"public_key"`
 	ForwardAgent *bool  `yaml:"forward_agent"`
 	Agent        *Agent `yaml:"agent"`
@@ -30,7 +30,8 @@ type VolumeSpec struct {
 }
 
 type Profile struct {
-	Types    []string    `yaml:"types"` // preference order, first available wins
+	Provider string      `yaml:"provider"` // optional pin; empty = the config/flag choice
+	Types    []string    `yaml:"types"`    // preference order, first available wins
 	Spot     bool        `yaml:"spot"`
 	Location string      `yaml:"location"` // optional pin, e.g. FIN-01
 	Image    string      `yaml:"image"`    // empty = provider default for the type
@@ -47,12 +48,91 @@ type Defaults struct {
 	OSGB  int    `yaml:"os_volume_gb"`
 }
 
+// ProviderConfig is one entry of the providers: map. Config carries only the
+// credentials file and the raw block; the driver decodes its own keys with
+// Decode. Obtain one via Config.ProviderConfig so the fallbacks and error
+// context are filled in.
+type ProviderConfig struct {
+	CredentialsFile string // KEY=VALUE file consulted after the environment
+
+	name string    // provider name, for error text
+	path string    // config file path, for error text
+	node yaml.Node // the raw block, for Decode
+}
+
+// UnmarshalYAML keeps the whole block so the driver can decode it later.
+func (p *ProviderConfig) UnmarshalYAML(n *yaml.Node) error {
+	var head struct {
+		CredentialsFile string `yaml:"credentials_file"`
+	}
+	if err := n.Decode(&head); err != nil {
+		return err
+	}
+	p.CredentialsFile = head.CredentialsFile
+	p.node = *n
+	return nil
+}
+
+// Decode fills out with the driver-specific keys of this provider's block.
+// An absent block leaves out untouched.
+func (p ProviderConfig) Decode(out any) error {
+	if p.node.Kind == 0 {
+		return nil
+	}
+	if err := p.node.Decode(out); err != nil {
+		return fmt.Errorf("providers.%s in %s: %w", p.name, p.path, err)
+	}
+	return nil
+}
+
+// Creds resolves the named credential variables: the environment first,
+// then CredentialsFile. Every name must resolve; the error names the missing
+// variables and the file consulted.
+func (p ProviderConfig) Creds(envNames []string) (map[string]string, error) {
+	out := map[string]string{}
+	var missing []string
+	for _, n := range envNames {
+		if v := os.Getenv(n); v != "" {
+			out[n] = v
+		} else {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) == 0 {
+		return out, nil
+	}
+	if p.CredentialsFile == "" {
+		key := "credentials_file"
+		if p.name != "verda" {
+			key = "providers." + p.name + ".credentials_file"
+		}
+		return nil, fmt.Errorf("%s not set and no %s in %s", strings.Join(missing, "/"), key, p.path)
+	}
+	env, err := ParseEnvFile(ExpandHome(p.CredentialsFile))
+	if err != nil {
+		return nil, err
+	}
+	var still []string
+	for _, n := range missing {
+		if v := env[n]; v != "" {
+			out[n] = v
+		} else {
+			still = append(still, n)
+		}
+	}
+	if len(still) > 0 {
+		return nil, fmt.Errorf("%s missing %s", p.CredentialsFile, strings.Join(still, "/"))
+	}
+	return out, nil
+}
+
 type Config struct {
-	Provider        string             `yaml:"provider"`
-	CredentialsFile string             `yaml:"credentials_file"`
-	SSH             SSH                `yaml:"ssh"`
-	Defaults        Defaults           `yaml:"defaults"`
-	Profiles        map[string]Profile `yaml:"profiles"`
+	Provider        string                    `yaml:"provider"`         // default provider; verda when unset
+	CredentialsFile string                    `yaml:"credentials_file"` // legacy: Verda's credentials file
+	Providers       map[string]ProviderConfig `yaml:"providers"`
+	SSH             SSH                       `yaml:"ssh"`
+	Defaults        Defaults                  `yaml:"defaults"`
+	Profiles        map[string]Profile        `yaml:"profiles"`
 
 	path string
 }
@@ -68,7 +148,6 @@ func DefaultPath() string {
 func Load() (*Config, error) {
 	cfg := &Config{
 		Provider: "verda",
-		SSH:      SSH{User: "root"},
 		Defaults: Defaults{TTL: "12h"},
 		path:     DefaultPath(),
 	}
@@ -84,9 +163,6 @@ func Load() (*Config, error) {
 	}
 	if cfg.Provider == "" {
 		cfg.Provider = "verda"
-	}
-	if cfg.SSH.User == "" {
-		cfg.SSH.User = "root"
 	}
 	if cfg.Defaults.TTL == "" {
 		cfg.Defaults.TTL = "12h"
@@ -169,25 +245,22 @@ func (c *Config) IdentityFile() string {
 	return ""
 }
 
-// Credentials resolves provider credentials: environment first, then
-// credentials_file (a KEY=VALUE env file, `export` prefixes allowed).
-func (c *Config) Credentials() (id, secret string, err error) {
-	id, secret = os.Getenv("VERDA_CLIENT_ID"), os.Getenv("VERDA_CLIENT_SECRET")
-	if id != "" && secret != "" {
-		return id, secret, nil
+// ProviderConfig returns the named provider's block, or an empty one when
+// the config has none. The legacy top-level credentials_file stands in for
+// providers.verda.credentials_file.
+func (c *Config) ProviderConfig(name string) ProviderConfig {
+	pc := c.Providers[name]
+	if name == "verda" && pc.CredentialsFile == "" {
+		pc.CredentialsFile = c.CredentialsFile
 	}
-	if c.CredentialsFile == "" {
-		return "", "", fmt.Errorf("VERDA_CLIENT_ID/VERDA_CLIENT_SECRET not set and no credentials_file in %s", c.path)
-	}
-	env, err := ParseEnvFile(ExpandHome(c.CredentialsFile))
-	if err != nil {
-		return "", "", err
-	}
-	id, secret = env["VERDA_CLIENT_ID"], env["VERDA_CLIENT_SECRET"]
-	if id == "" || secret == "" {
-		return "", "", fmt.Errorf("%s missing VERDA_CLIENT_ID/VERDA_CLIENT_SECRET", c.CredentialsFile)
-	}
-	return id, secret, nil
+	pc.name, pc.path = name, c.path
+	return pc
+}
+
+// Creds resolves the named provider's credential variables: environment
+// first, then its credentials_file. See ProviderConfig.Creds.
+func (c *Config) Creds(provider string, envNames []string) (map[string]string, error) {
+	return c.ProviderConfig(provider).Creds(envNames)
 }
 
 func ParseEnvFile(path string) (map[string]string, error) {

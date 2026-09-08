@@ -20,7 +20,14 @@ import (
 // address older than a typical TTL is more likely stale than not.
 const MaxAge = 12 * time.Hour
 
-// Entry is a cached instance plus when it was recorded.
+// DefaultProvider is the provider an entry recorded before entries carried
+// one belongs to: every cache written by a single-provider rig was Verda's.
+const DefaultProvider = "verda"
+
+// Entry is a cached instance plus when it was recorded. Its Provider is
+// always filled once loaded (see DefaultProvider), so two clouds' same-named
+// instances are distinct entries and a listing from one never touches the
+// other's.
 type Entry struct {
 	provider.Instance
 	CachedAt time.Time `json:"cached_at"`
@@ -49,7 +56,23 @@ func load(path string) ([]Entry, error) {
 	if err := json.Unmarshal(b, &entries); err != nil {
 		return nil, nil
 	}
+	for i := range entries {
+		entries[i].Provider = orDefault(entries[i].Provider)
+	}
 	return entries, nil
+}
+
+func orDefault(prov string) string {
+	if prov == "" {
+		return DefaultProvider
+	}
+	return prov
+}
+
+// same reports whether e is the cache's entry for in: the same provider's
+// instance by ID or by name.
+func same(e Entry, in provider.Instance) bool {
+	return e.Provider == orDefault(in.Provider) && (e.ID == in.ID || e.Name == in.Name)
 }
 
 // save rewrites the cache atomically (temp file plus rename), so a reader
@@ -104,16 +127,17 @@ func Read(path string, now time.Time) ([]provider.Instance, error) {
 	return out, nil
 }
 
-// Put records in, replacing any entry with the same ID or name and dropping
-// entries older than MaxAge.
+// Put records in, replacing the same provider's entry with the same ID or
+// name and dropping entries older than MaxAge.
 func Put(path string, in provider.Instance, now time.Time) error {
 	entries, err := load(path)
 	if err != nil {
 		return err
 	}
+	in.Provider = orDefault(in.Provider)
 	kept := make([]Entry, 0, len(entries)+1)
 	for _, e := range entries {
-		if e.ID == in.ID || e.Name == in.Name || !fresh(e, now) {
+		if same(e, in) || !fresh(e, now) {
 			continue
 		}
 		kept = append(kept, e)
@@ -142,25 +166,33 @@ func Remove(path, key string) error {
 	return save(path, kept)
 }
 
-// Reconcile aligns the cache with a fresh provider listing: entries whose
-// instance is still running are refreshed from it, the rest are dropped. It
-// never adds entries — only up and adopt do — so a missing cache stays
-// missing.
-func Reconcile(path string, live []provider.Instance, now time.Time) error {
+// Reconcile aligns the cache with a fresh listing from prov: that provider's
+// entries whose instance is still running are refreshed from the listing
+// (and tagged prov), the rest of its entries are dropped, and other
+// providers' entries are left exactly as they were — the listing says
+// nothing about them. It never adds entries — only up and adopt do — so a
+// missing cache stays missing.
+func Reconcile(path, prov string, live []provider.Instance, now time.Time) error {
 	entries, err := load(path)
 	if err != nil || len(entries) == 0 {
 		return err
 	}
+	prov = orDefault(prov)
 	byID := make(map[string]provider.Instance, len(live))
 	for _, in := range live {
 		byID[in.ID] = in
 	}
 	kept := make([]Entry, 0, len(entries))
 	for _, e := range entries {
-		in, ok := byID[e.ID]
-		if !ok || in.Status != "running" || in.IP == "" {
+		if e.Provider != prov {
+			kept = append(kept, e)
 			continue
 		}
+		in, ok := byID[e.ID]
+		if !ok || in.Status != provider.Running || in.IP == "" {
+			continue
+		}
+		in.Provider = prov
 		kept = append(kept, Entry{Instance: in, CachedAt: now})
 	}
 	return save(path, kept)

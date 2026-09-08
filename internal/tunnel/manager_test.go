@@ -1,6 +1,8 @@
 package tunnel
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -353,5 +355,88 @@ func TestEnsureReplacesTunnelWithStaleEndpoint(t *testing.T) {
 	live, _ := w.manager().List()
 	if len(live) != 1 || live[0].IP != "10.0.0.5" {
 		t.Errorf("live = %+v, want only the replacement", live)
+	}
+}
+
+// A container's mapped sshd port is part of the endpoint: it must round-trip
+// through the state file so the supervisor dials it, and a live tunnel
+// recorded on the old port after a restart remapped it is stale — replaced,
+// not reported already-up.
+func TestEnsureRecordsPortAndReplacesRemappedTunnel(t *testing.T) {
+	w := newWorld(t)
+	w.alive[42] = true
+	old := Endpoint{Instance: "rig-pod", ID: "id-7", IP: "1.2.3.4", Port: 10341}
+	w.seed(State{Endpoint: old, Forwards: fwd([2]int{8000, 8000}), PID: 42, Phase: PhaseConnected})
+	live, err := w.manager().List()
+	if err != nil || len(live) != 1 || live[0].Port != 10341 {
+		t.Fatalf("List = %+v, %v; want the seeded tunnel with port 10341", live, err)
+	}
+
+	remapped := Endpoint{Instance: "rig-pod", ID: "id-7", IP: "1.2.3.4", Port: 20517}
+	w.onLaunch = w.connectedSupervisor(43)
+	st, already, err := w.manager().Ensure(remapped, fwd([2]int{8000, 8000}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if already {
+		t.Error("ensure reported a tunnel to the old port as already-up")
+	}
+	if len(w.stopped) != 1 || w.stopped[0] != 42 {
+		t.Errorf("stopped = %v, want the old-port supervisor (42)", w.stopped)
+	}
+	if st.PID != 43 || st.Port != 20517 {
+		t.Errorf("state = %+v, want a fresh pid-43 tunnel on port 20517", st)
+	}
+	if len(w.launched) != 1 || w.launched[0].Port != 20517 {
+		t.Errorf("launched = %+v, want the supervisor handed port 20517", w.launched)
+	}
+}
+
+// A VM on port 22 is recorded exactly as before this field existed: no port
+// key in the file, so old state files and new ones read the same.
+func TestStateOmitsDefaultPort(t *testing.T) {
+	w := newWorld(t)
+	w.alive[42] = true
+	w.seed(State{Endpoint: ep, Forwards: fwd([2]int{8000, 8000}), PID: 42, Phase: PhaseConnected})
+	files, _ := filepath.Glob(filepath.Join(w.dir, "*.json"))
+	if len(files) != 1 {
+		t.Fatalf("state files = %v", files)
+	}
+	b, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"port"`) {
+		t.Errorf("default-port state must not carry a port key: %s", b)
+	}
+}
+
+// A non-root login user (an AWS image's ubuntu) is part of the endpoint: it
+// must round-trip through the state file so the supervisor logs in as that
+// user, while a root endpoint is recorded exactly as before the field
+// existed — no user key — so old state files and new ones read the same.
+func TestEnsureRecordsUser(t *testing.T) {
+	w := newWorld(t)
+	w.onLaunch = w.connectedSupervisor(42)
+	dlami := Endpoint{Instance: "rig-aws", ID: "i-1", IP: "3.4.5.6", User: "ubuntu"}
+	st, _, err := w.manager().Ensure(dlami, fwd([2]int{8000, 8000}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.User != "ubuntu" || len(w.launched) != 1 || w.launched[0].User != "ubuntu" {
+		t.Errorf("state = %+v, launched = %+v; want the supervisor handed user ubuntu", st, w.launched)
+	}
+	live, err := w.manager().List()
+	if err != nil || len(live) != 1 || live[0].User != "ubuntu" {
+		t.Errorf("List = %+v, %v; want the tunnel with user ubuntu", live, err)
+	}
+
+	w.seed(State{Endpoint: ep, Forwards: fwd([2]int{9090, 9090}), PID: 43, Phase: PhaseConnected})
+	b, err := os.ReadFile(State{Endpoint: ep, Forwards: fwd([2]int{9090, 9090})}.statePath(w.dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"user"`) {
+		t.Errorf("root-user state must not carry a user key: %s", b)
 	}
 }

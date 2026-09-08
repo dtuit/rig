@@ -10,13 +10,18 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
 
 type Target struct {
-	User         string
-	Host         string
+	User string
+	Host string
+	// Port is the sshd port; 0 means 22. A non-default port is emitted as
+	// -p on every ssh argv (and so inside rsync's -e transport), so a
+	// container's host-mapped sshd is reached with no caller involvement.
+	Port         int
 	ForwardAgent bool
 	IdentityFile string // explicit private key; keeps rig working when no agent is alive
 	AgentSocket  string // SSH_AUTH_SOCK override (rig-managed agent)
@@ -42,6 +47,14 @@ func (t Target) env() []string {
 
 func (t Target) addr() string { return t.User + "@" + t.Host }
 
+// port is the effective sshd port.
+func (t Target) port() int {
+	if t.Port == 0 {
+		return 22
+	}
+	return t.Port
+}
+
 func (t Target) baseArgs() []string {
 	args := []string{
 		"-o", "StrictHostKeyChecking=no",
@@ -63,6 +76,9 @@ func (t Target) baseArgs() []string {
 	}
 	if t.IdentityFile != "" {
 		args = append(args, "-i", t.IdentityFile)
+	}
+	if p := t.port(); p != 22 {
+		args = append(args, "-p", strconv.Itoa(p))
 	}
 	return args
 }
@@ -215,7 +231,7 @@ func (t Target) Rsync(src, dest string, excludes []string, delete, progress bool
 func (t Target) WaitForSSH(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(t.Host, "22"), 5*time.Second)
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(t.Host, strconv.Itoa(t.port())), 5*time.Second)
 		if err == nil {
 			conn.Close()
 			if _, err := t.Run("true"); err == nil {

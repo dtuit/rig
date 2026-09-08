@@ -204,3 +204,22 @@ func TestResolveTunnelInstance(t *testing.T) {
 		t.Errorf("no-tunnels resolve = %q, %v; want empty success", got, err)
 	}
 }
+
+// A tunnel to a container's mapped port shows where it really connects.
+func TestTunnelStatusTableShowsHostPortWhenNotDefault(t *testing.T) {
+	tunnelDir(t)
+	pod := connectedState("rig-pod", "id-7", "1.2.3.4", os.Getpid(), 8000, 8000)
+	pod.Port = 10341
+	seedTunnel(t, pod)
+	seedTunnel(t, connectedState("rig-train", "id-1", "10.0.0.5", os.Getpid(), 9090, 9090))
+
+	out := runRig(t, &fakeProvider{}, "tunnel", "status")
+	for _, want := range []string{"1.2.3.4:10341", "  10.0.0.5  "} {
+		if !strings.Contains(out, want) {
+			t.Errorf("table missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "10.0.0.5:22") {
+		t.Errorf("port 22 must not be shown:\n%s", out)
+	}
+}
