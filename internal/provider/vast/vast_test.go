@@ -244,8 +244,8 @@ func near(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
 func TestCapabilities(t *testing.T) {
 	d := New(testKey, Config{})
 	caps := d.Capabilities()
-	if !caps.Spot || caps.Volumes || !caps.Balance {
-		t.Errorf("Capabilities = %+v, want spot and balance, no volumes", caps)
+	if !caps.Spot || caps.Volumes || !caps.Balance || !caps.DockerImages {
+		t.Errorf("Capabilities = %+v, want spot, balance and docker images, no volumes", caps)
 	}
 	for _, want := range []string{"/etc/environment", "$CONTAINER_ID", "$CONTAINER_API_KEY", `{"state":"stopped"}`} {
 		if !strings.Contains(caps.SelfStop, want) {

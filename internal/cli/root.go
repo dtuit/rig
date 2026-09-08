@@ -76,7 +76,7 @@ func stderrLogf(format string, a ...any) {
 func NewRoot() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "rig",
-		Short:         "rig — GPU cloud workbench (Verda)",
+		Short:         "rig — GPU cloud workbench",
 		Long:          "rig provisions ephemeral GPU instances with persistent volumes,\ngets you (or your agent) onto them, and runs detached jobs that\nsurvive disconnects. Without arguments it opens the dashboard.",
 		SilenceUsage:  true,
 		SilenceErrors: true,

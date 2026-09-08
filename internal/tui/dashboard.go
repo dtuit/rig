@@ -51,8 +51,12 @@ func fetch(ctx context.Context, a *core.App) tea.Cmd {
 			return d
 		}
 		d.volumes, _ = a.Prov.ListVolumes(ctx)
-		if amt, cur, err := a.Prov.Balance(ctx); err == nil {
-			d.balance = fmt.Sprintf("%.2f %s", amt, cur)
+		// A cloud that cannot report a balance (or refuses this call) gets
+		// no balance tile rather than an error line.
+		if a.Prov.Capabilities().Balance {
+			if amt, cur, err := a.Prov.Balance(ctx); err == nil {
+				d.balance = fmt.Sprintf("%.2f %s", amt, cur)
+			}
 		}
 		return d
 	}
@@ -133,20 +137,22 @@ func (m dashModel) doAction(action string) tea.Cmd {
 
 func (m dashModel) View() string {
 	var b strings.Builder
-	title := "rig"
+	head := titleStyle.Render("rig · " + m.app.Provider())
 	if m.data.balance != "" {
-		title += dimStyle.Render("  balance " + m.data.balance)
+		head += dimStyle.Render("  balance " + m.data.balance)
 	}
 	if m.loading {
-		title += dimStyle.Render("  refreshing...")
+		head += dimStyle.Render("  refreshing...")
 	}
-	b.WriteString(titleStyle.Render("rig") + dimStyle.Render(strings.TrimPrefix(title, "rig")) + "\n\n")
+	b.WriteString(head + "\n\n")
 
 	if m.data.err != nil {
 		b.WriteString(errStyle.Render("error: "+m.data.err.Error()) + "\n")
 	}
 
-	b.WriteString(headerStyle.Render(fmt.Sprintf("  %-16s %-12s %-18s %-15s %-7s %-9s %s",
+	// The columns fit the widest reading of each: a container's host:port
+	// endpoint, and an AWS availability zone in LOC.
+	b.WriteString(headerStyle.Render(fmt.Sprintf("  %-14s %-12s %-16s %-21s %-15s %-9s %s",
 		"NAME", "STATUS", "TYPE", "IP", "LOC", "$/H", "AGE")) + "\n")
 	if len(m.data.instances) == 0 {
 		b.WriteString(dimStyle.Render("  no rig instances — rig up to create one") + "\n")
@@ -171,23 +177,23 @@ func (m dashModel) View() string {
 		if in.Spot {
 			price += " spot"
 		}
-		b.WriteString(fmt.Sprintf("%s%-16s %s %-18s %-15s %-7s %-9s %s\n",
+		b.WriteString(fmt.Sprintf("%s%-14s %s %-16s %-21s %-15s %-9s %s\n",
 			cursor, strings.TrimPrefix(in.Name, core.HostPrefix), status, in.Type,
-			in.IP, in.Location, price, ageShort(in.CreatedAt)))
+			endpointText(in), in.Location, price, ageShort(in.CreatedAt)))
 	}
 	if burn > 0 {
 		b.WriteString(dimStyle.Render(fmt.Sprintf("\n  burn rate $%.2f/h ($%.0f/day)", burn, burn*24)) + "\n")
 	}
 
 	if len(m.data.volumes) > 0 {
-		b.WriteString("\n" + headerStyle.Render(fmt.Sprintf("  %-16s %-8s %-12s %-7s %s",
+		b.WriteString("\n" + headerStyle.Render(fmt.Sprintf("  %-16s %-8s %-12s %-15s %s",
 			"VOLUME", "SIZE", "TYPE", "LOC", "ATTACHED")) + "\n")
 		for _, v := range m.data.volumes {
 			att := "-"
 			if v.IsAttached() {
 				att = "yes"
 			}
-			b.WriteString(fmt.Sprintf("  %-16s %-8s %-12s %-7s %s\n",
+			b.WriteString(fmt.Sprintf("  %-16s %-8s %-12s %-15s %s\n",
 				v.Name, fmt.Sprintf("%dGB", v.SizeGB), v.Type, v.Location, att))
 		}
 	}
@@ -202,6 +208,20 @@ func (m dashModel) View() string {
 		b.WriteString(helpStyle.Render("\n  ↑/↓ select · d delete · r refresh · q quit"))
 	}
 	return b.String()
+}
+
+// endpointText renders the instance's ssh endpoint for the IP column: the
+// host alone on the default port, as every VM is, and host:port for a
+// container's mapped sshd — the same reading as `rig status`.
+func endpointText(in provider.Instance) string {
+	host := in.SSH.Host
+	if host == "" {
+		host = in.IP
+	}
+	if p := in.SSH.Port; p != 0 && p != 22 {
+		return fmt.Sprintf("%s:%d", host, p)
+	}
+	return host
 }
 
 func ageShort(t time.Time) string {

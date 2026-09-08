@@ -575,7 +575,7 @@ func TestEnsureSSHKeyRegistersNothing(t *testing.T) {
 
 func TestCapabilities(t *testing.T) {
 	caps := newServer(t, nil).driver(t, runpod.Options{}).Capabilities()
-	if caps.Spot || !caps.Volumes || !caps.Balance {
+	if caps.Spot || !caps.Volumes || !caps.Balance || !caps.DockerImages {
 		t.Errorf("Capabilities = %+v", caps)
 	}
 	want := `. /etc/rp_environment && curl -fsS -X POST "https://api.runpod.io/v2/pods/$RUNPOD_POD_ID/action" -H "Authorization: Bearer $RUNPOD_API_KEY" -H 'Content-Type: application/json' -d '{"action":"stop"}'`

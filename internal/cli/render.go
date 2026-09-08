@@ -17,6 +17,15 @@ func hostPort(host string, port int) string {
 	return fmt.Sprintf("%s:%d", host, port)
 }
 
+// memGB renders system RAM for a human table: a catalogue that does not
+// quote it (RunPod's) reports 0, which reads as a dash, not 0GB.
+func memGB(gb int) string {
+	if gb == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%dGB", gb)
+}
+
 // renderJSON emits v for machine consumption (ADR-0002): the existing structs,
 // one JSON document, no prose. A nil slice renders as [] — empty lists are
 // data, not null.

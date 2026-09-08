@@ -20,11 +20,18 @@ type fakeProvider struct {
 	instances []provider.Instance
 	types     []provider.InstanceType
 	volumes   []provider.Volume
+	images    []provider.Image
 	avail     map[string][]string
+	// caps overrides what Capabilities reports; nil is a cloud with spot,
+	// volumes and a balance, as Verda is.
+	caps *provider.Capabilities
 }
 
 func (f *fakeProvider) Name() string { return "fake" }
 func (f *fakeProvider) Capabilities() provider.Capabilities {
+	if f.caps != nil {
+		return *f.caps
+	}
 	return provider.Capabilities{Spot: true, Volumes: true, Balance: true}
 }
 func (f *fakeProvider) Locations(context.Context) ([]provider.Location, error) {
@@ -37,7 +44,7 @@ func (f *fakeProvider) Availability(context.Context, bool) (map[string][]string,
 	return f.avail, nil
 }
 func (f *fakeProvider) Images(context.Context, string) ([]provider.Image, error) {
-	return nil, fmt.Errorf("not implemented")
+	return f.images, nil
 }
 func (f *fakeProvider) ListInstances(context.Context) ([]provider.Instance, error) {
 	return f.instances, nil

@@ -67,17 +67,25 @@ func newTypesCmd() *cobra.Command {
 			if jsonFlag {
 				return renderJSON(rows)
 			}
+			fmt.Printf("provider: %s\n", a.Provider())
 			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "TYPE\tGPU\tMEM\t$/H\tSPOT$/H\tAVAILABLE")
 			unavailable := 0
+			hasSpot := a.Prov.Capabilities().Spot
 			for _, r := range rows {
 				availStr := strings.Join(r.Available, ",")
 				if availStr == "" {
 					availStr = "-"
 					unavailable++
 				}
-				fmt.Fprintf(w, "%s\t%s\t%dGB\t%.2f\t%.2f\t%s\n",
-					r.Type, r.GPU, r.MemoryGB, r.PricePerHour, r.SpotPrice, availStr)
+				// A cloud without spot capacity leaves the column empty
+				// rather than quoting 0.00 as if it were a price.
+				spotStr := ""
+				if hasSpot {
+					spotStr = fmt.Sprintf("%.2f", r.SpotPrice)
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%.2f\t%s\t%s\n",
+					r.Type, r.GPU, memGB(r.MemoryGB), r.PricePerHour, spotStr, availStr)
 			}
 			if err := w.Flush(); err != nil {
 				return err
@@ -116,6 +124,7 @@ func newImagesCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			fmt.Printf("provider: %s\n", a.Provider())
 			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "IMAGE\tNAME\tDEFAULT")
 			for _, im := range imgs {
@@ -125,7 +134,15 @@ func newImagesCmd() *cobra.Command {
 				}
 				fmt.Fprintf(w, "%s\t%s\t%s\n", im.Name, im.Display, def)
 			}
-			return w.Flush()
+			if err := w.Flush(); err != nil {
+				return err
+			}
+			// A Docker-image cloud has no image catalogue to list: the rows
+			// above are only rig's default and whatever the config names.
+			if a.Prov.Capabilities().DockerImages {
+				fmt.Println("any image reference is accepted with --image / image:")
+			}
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&forType, "type", "", "limit to images valid for this instance type")
@@ -221,12 +238,23 @@ providers:                             # per-provider blocks; env vars always wi
   runpod:
     credentials_file: ~/secrets/runpod.env # RUNPOD_API_KEY (or RUNPOD_KEY)
     cloud: secure                          # or community
+    image: runpod/pytorch:1.2.0-rc.162-cu1290-torch291-ubuntu2404  # any Docker reference
+    disk_gb: 20                            # container disk (wiped on restart)
   vast:
     credentials_file: ~/secrets/vast.env   # VAST_API_KEY
-    min_reliability: 0.95
+    min_reliability: 0.95                  # host reliability floor, 0..1
+    bid_markup: 1.2                        # spot bid = min_bid x markup
+    direct_only: false                     # true rents only hosts with open ports
+    image: vastai/pytorch:cuda-12.8.1-auto # any Docker reference
+    disk_gb: 20                            # container disk
+    filters: { cuda_max_good: { gte: 12.8 } }  # extra offer-query clauses
   aws:
     profile: default                       # SDK credential chain; AWS_PROFILE also honoured
-    region: ap-southeast-2
+    region: ap-southeast-2                 # one region per block
+    security_group: rig                    # created in the default VPC, opens 22/tcp
+    default_image: ""                      # SSM parameter path (/aws/...) or ami-xxxx
+    volume_type: gp3                       # EBS type for data volumes
+    families: [g6, g6e, p5]                # instance families rig types lists
 ssh:
   user: root                           # optional override of the provider's login user
   public_key: ~/.ssh/id_ed25519.pub

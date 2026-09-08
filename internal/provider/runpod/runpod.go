@@ -154,7 +154,7 @@ func New(key string, opts Options) (*Driver, error) {
 func (d *Driver) Name() string { return "runpod" }
 
 func (d *Driver) Capabilities() provider.Capabilities {
-	return provider.Capabilities{Spot: false, Volumes: true, Balance: true, SelfStop: SelfStop}
+	return provider.Capabilities{Spot: false, Volumes: true, Balance: true, DockerImages: true, SelfStop: SelfStop}
 }
 
 func (d *Driver) logf(format string, a ...any) {

@@ -5,8 +5,10 @@ volumes, gets you (or your AI agent) onto them, and runs detached jobs that
 survive disconnects — then makes sure the instance kills itself before it
 burns a hole in the bill.
 
-Provider-abstracted; [Verda](https://verda.com) (formerly DataCrunch) is the
-first driver, via the official Go SDK.
+Provider-abstracted, with drivers for [Verda](https://verda.com) (formerly
+DataCrunch), [RunPod](https://runpod.io), [Vast.ai](https://vast.ai) and AWS
+EC2. One provider per command: set the default in config, pin it per profile,
+or pass `--provider`.
 
 ## Install
 
@@ -14,40 +16,84 @@ first driver, via the official Go SDK.
 go install github.com/dtuit/rig/cmd/rig@latest
 ```
 
-Requires `ssh`, `rsync` locally; instances need `tmux` + `systemd` (Verda's
-stock Ubuntu images qualify).
+Requires `ssh`, `rsync` locally. Instances need `tmux` and either systemd or a
+Docker container rig can install into: stock Ubuntu images (Verda, the AWS Deep
+Learning AMI) take the systemd path, RunPod pods and Vast instances the
+container one. `rig up` installs `tmux` and `rsync` with apt when they are
+missing, so any image with sshd works.
 
 ## Configure
 
 `~/.config/rig/config.yml` (see `rig config` for an example):
 
 ```yaml
-provider: verda
-credentials_file: ~/secrets/verda.env   # VERDA_CLIENT_ID / VERDA_CLIENT_SECRET
+provider: verda                          # default; a profile may pin its own, --provider wins
+providers:                               # per-provider blocks; env vars always beat credentials_file
+  verda:
+    credentials_file: ~/secrets/verda.env  # VERDA_CLIENT_ID / VERDA_CLIENT_SECRET
+  runpod:
+    credentials_file: ~/secrets/runpod.env # RUNPOD_API_KEY (or RUNPOD_KEY)
+    cloud: secure                          # or community; also image, disk_gb
+  vast:
+    credentials_file: ~/secrets/vast.env   # VAST_API_KEY
+    min_reliability: 0.95                  # also bid_markup, direct_only, image, disk_gb, filters
+  aws:
+    profile: default                       # SDK credential chain; AWS_PROFILE honoured
+    region: ap-southeast-2                 # also security_group, default_image, volume_type
 ssh:
-  user: root
-  public_key: ~/.ssh/id_ed25519.pub     # registered with the provider on first up
+  user: root                             # optional override of the provider's login user
+  public_key: ~/.ssh/id_ed25519.pub      # registered with the provider on first up
   forward_agent: true
 defaults:
   ttl: 12h
 profiles:
   train:
-    types: [1H100.80S.32V, 1A100.22V]   # preference order, first available wins
+    types: [1H100.80S.32V, 1A100.22V]    # preference order, first available wins
     spot: false
     volume: { name: rig-data, size_gb: 500 }
     ttl: 24h
     ports: [8000]
-    env_files: [~/.config/rig/train.env]  # pushed to ~/.rig/env, sourced by jobs
+    env_files: [~/.config/rig/train.env]   # pushed to ~/.rig/env, sourced by jobs
+  pod:
+    provider: runpod                       # pin a profile to another cloud
+    types: [1xA100-SXM]
 ```
 
-Environment variables (`VERDA_CLIENT_ID`/`VERDA_CLIENT_SECRET`) override the
-credentials file. Get credentials from the Verda console under
-*Keys → REST API Credentials*.
+Credentials resolve one variable at a time: the environment first, then that
+provider's `credentials_file`. A top-level `credentials_file` still means
+Verda's. AWS holds no rig-managed secret at all — the SDK's default chain does
+it, so `aws sso login --profile <name>` is the whole story. Get the keys from
+the Verda console (*Keys → REST API Credentials*), RunPod (*Settings → API
+Keys*) and Vast (*Account → API keys*).
+
+### Per-provider caveats
+
+|                | Verda | RunPod | Vast.ai | AWS EC2 |
+| -------------- | ----- | ------ | ------- | ------- |
+| **Type**       | catalogue name (`1H100.80S.32V`) | token (`1xA100-SXM`) | token (`1xRTX-4090`) | native name (`g6e.xlarge`) |
+| **Location**   | location code (`FIN-01`) | datacenter id (`US-TX-3`); `any` on the community cloud | geolocation, as the API spells it | availability zone in the block's region |
+| **Spot**       | yes | no — the v2 API has no bid fields | yes: bid = min bid × `bid_markup` | yes: one-time request, an interruption terminates |
+| **Data volume**| yes | network volume, mounted at `/workspace` | no — Vast volumes are machine-bound | EBS, formatted and mounted at `/mnt/<name>` |
+| **Balance**    | yes | yes | yes | no |
+| **ssh**        | `root@IP:22` | container on a host-mapped port, user `root` | mapped port or Vast's proxy host, user `root` | `ubuntu@IP:22` |
+| **Self-stop**  | `shutdown -h now` | pod-scoped key → `POST /pods/{id}/action stop` | `CONTAINER_API_KEY` → `PUT /instances/{id}/ state=stopped` | `shutdown -h now` |
+
+Marketplace type tokens are `<count>x<GPU name with spaces as dashes>`, and
+matching is case-insensitive, so `--type 1xrtx-4090` finds the same offers as
+`--type 1xRTX-4090`. What a cloud cannot do fails loudly rather than quietly:
+`spot: true` on RunPod and a `volume:` on Vast are refused before anything is
+created, and the dashboard hides the balance tile on AWS.
+
+**A RunPod restart wipes the footprint.** A pod's container disk is ephemeral,
+so a restart from the RunPod console or API — or a start after the watchdog
+stopped the pod — deletes `~/.rig` with the deadline, `ttl.sh` and the re-arm
+hook in it. The pod then runs with **no watchdog** and `rig status` shows its
+TTL as `-`. Run `rig adopt <name>` after any such restart.
 
 ## Use
 
 ```bash
-rig                      # dashboard TUI: instances, volumes, burn rate, balance
+rig                      # dashboard TUI: provider, instances, volumes, burn rate, balance
 rig up                   # interactive picker over LIVE availability + pricing
 rig up train             # headless: first available type from the profile
 rig up --type CPU.4V.16G --name smoke --ttl 1h   # fully ad-hoc
@@ -55,6 +101,7 @@ rig up --type 1H100.80S.32V --env-file ~/secrets/hf.env   # push KEY=VALUE files
 
 rig status               # table: status, IP, $/h, age, time-to-self-destruct
 rig types --available    # what can actually be deployed right now
+rig --provider vast types --available    # shop another cloud without touching config
 rig ssh [-- cmd]         # interactive shell or one-off command (agent forwarded)
 rig sync ~/code/project    # rsync a working tree to the box
 rig sync data --exclude images/          # skip subtrees (repeatable, stacks on defaults)
@@ -98,10 +145,11 @@ output shows only on a terminal running a single stream; `--quiet` drops it,
 
 - **Ephemeral instances, persistent volumes.** Instances are disposable;
   the expensive-to-rebuild state (venvs, model weights, datasets) lives on a
-  named volume that `rig up` finds-or-creates in whichever datacenter the
-  instance lands in. Volumes are datacenter-bound, so a profile may
-  accumulate one volume per location; locations that already hold the
-  profile's volume are preferred during placement.
+  named volume that `rig up` finds-or-creates in whichever location the
+  instance lands in. Volumes are location-bound (datacenter on Verda and
+  RunPod, availability zone on AWS), so a profile may accumulate one volume
+  per location; locations that already hold the profile's volume are
+  preferred during placement.
 - **Preference lists, not fixed types.** GPU availability is volatile.
   Profiles declare `types: [A, B, C]` and rig takes the first that is
   actually deployable, optionally pinned to a location.
@@ -110,7 +158,11 @@ output shows only on a terminal running a single stream; `--quiet` drops it,
   deferring an hour at a time while any rig job is still running, or while
   any executable hook in `~/.rig/busy.d/` exits 0 (drop a script there to
   gate shutdown on a wandb run, a health endpoint, whatever). A shut-down
-  instance stops billing for compute.
+  instance stops billing for compute. On a container with no systemd the
+  same script runs under `nohup setsid`, pid-filed at `~/.rig/ttl.pid` and
+  re-armed on container start by `~/.rig/onstart.sh`; the line it runs at
+  the deadline is the provider's self-stop call instead of `shutdown`
+  (ADR-0008).
 - **Jobs are tmux sessions.** `rig run` wraps the command in a named tmux
   session, logs to `~/.rig/logs/<name>.log`, records the exit code, and
   sources every file in `~/.rig/env/` first. Nothing depends on your laptop
@@ -132,7 +184,11 @@ output shows only on a terminal running a single stream; `--quiet` drops it,
   call. `status`, `down`, `extend` and `adopt` always ask the provider, and any
   fresh listing drops entries that have gone stale and refreshes the cached ssh
   endpoint (host, port, user) of the rest — so a container whose mapped port
-  moved on restart is reachable again after one such command.
+  moved on restart is reachable again after one such command. Both files tag
+  every record with the provider it belongs to (absent = Verda, so files
+  written before the other drivers existed read unchanged), so two clouds'
+  `rig-train` never collide and `rig spend` subtotals per provider once more
+  than one appears.
 
 ## Agent orchestration
 
@@ -151,15 +207,46 @@ rig status --json | jq -r '.[0].ttl'  # machine-readable everything
 rig down --yes                        # tear down when done
 ```
 
-The TTL watchdog is the safety net if the agent (or the human) forgets the
-last step.
+`rig status --json` carries the `provider` each instance is on and its `ssh`
+endpoint (`host`, `port`, `user`), so an agent needs no per-cloud knowledge to
+reach a box. The TTL watchdog is the safety net if the agent (or the human)
+forgets the last step.
 
 ## Extending to other providers
 
 `internal/provider` defines the interface (instances, volumes, images, SSH
-keys, live availability, balance); `internal/provider/verda` is ~300 lines
-against the official SDK. Everything above the interface — placement,
-volumes, TTL, jobs, TUI — is provider-agnostic.
+keys, live availability, balance) and a registry: a driver calls
+`provider.Register("<name>", factory)` from its `init()`, and `internal/cli`
+blank-imports the drivers it ships. `Capabilities{Spot, Volumes, Balance,
+DockerImages, SelfStop}` is how a driver declares what its cloud cannot do
+(ADR-0007), whether an image is any Docker reference, and what the TTL
+watchdog runs at the deadline (ADR-0008). Everything above the interface —
+placement, volumes, TTL, jobs, TUI — is provider-agnostic;
+`internal/provider/verda` is ~330 lines against the official SDK, and the
+marketplace and EC2 drivers 900–1500 against plain `net/http` or the AWS SDK.
+
+A new driver, in order:
+
+1. `New(creds, Config)` and an `init()` registering a factory that resolves
+   secrets with `cfg.Creds([]string{"X_API_KEY"})` and its own keys with
+   `cfg.Decode(&Config{})` — the `providers:` block is the driver's.
+2. The shopping half — `Locations`, `InstanceTypes`, `Availability`,
+   `Images` — speaking rig's vocabulary: normalised `Status` constants,
+   type tokens, location codes.
+3. `CreateInstance`, `GetInstance`, `ListInstances`, `DeleteInstance`,
+   filling `Instance.SSH` and wrapping "no stock" as `ErrNoCapacity` so `up`
+   walks to the next candidate instead of failing.
+4. Volumes and `Balance`, or `ErrUnsupported` plus the matching
+   `Capabilities` false — never a silent no-op.
+5. For a container cloud, `Capabilities.SelfStop`: a line that stops the
+   instance using only the token the provider injects (ADR-0003, ADR-0008).
+6. Tests. `internal/provider/fake` is the in-memory Provider the core tests
+   drive (scriptable availability, create errors, status sequences,
+   endpoints). A driver's own tests run it against `httptest` with recorded
+   JSON under `testdata/` and assert the vocabulary mapping — token ↔ GPU
+   id, status normalisation, endpoint derivation, mount-command synthesis —
+   never HTTP details; the AWS driver puts the SDK clients behind narrow
+   interfaces with hand-rolled fakes instead.
 
 ## License
 

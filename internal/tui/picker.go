@@ -17,14 +17,18 @@ import (
 // Picker walks the user through composing an UpSpec from live availability.
 // Returns nil spec (no error) if the user aborts.
 func Picker(ctx context.Context, a *core.App) (*core.UpSpec, error) {
+	caps := a.Prov.Capabilities()
 	spot := false
-	if err := run(huh.NewSelect[bool]().
-		Title("Pricing").
-		Options(
-			huh.NewOption("on-demand (stable)", false),
-			huh.NewOption("spot (~65% cheaper, can be preempted)", true),
-		).Value(&spot)); err != nil {
-		return nil, abortToNil(err)
+	// A cloud without spot capacity is not asked which pricing it wants.
+	if caps.Spot {
+		if err := run(huh.NewSelect[bool]().
+			Title("Pricing").
+			Options(
+				huh.NewOption("on-demand (stable)", false),
+				huh.NewOption("spot (~65% cheaper, can be preempted)", true),
+			).Value(&spot)); err != nil {
+			return nil, abortToNil(err)
+		}
 	}
 
 	types, err := a.Prov.InstanceTypes(ctx)
@@ -55,17 +59,24 @@ func Picker(ctx context.Context, a *core.App) (*core.UpSpec, error) {
 		}
 		gpu := t.GPU
 		if gpu == "" {
-			gpu = fmt.Sprintf("CPU only, %dGB RAM", t.MemoryGB)
+			gpu = "CPU only"
 		}
-		label := fmt.Sprintf("%-20s %-38s $%.2f/h  [%s]", t.Type, gpu, price, strings.Join(locs, ","))
-		typeOpts = append(typeOpts, huh.NewOption(label, t.Type))
+		// The columns are clipped, not wrapped: a marketplace catalogue's
+		// GPU names, descriptions and location lists are long enough to
+		// push the price off the line otherwise.
+		label := fmt.Sprintf("%-16s %-14s %-6s $%-7.2f %-14s %s",
+			t.Type, clip(gpu, 14), memText(t.MemoryGB), price, clip(t.Description, 14), locsText(locs))
+		typeOpts = append(typeOpts, huh.NewOption(strings.TrimRight(label, " "), t.Type))
 	}
 	if len(typeOpts) == 0 {
 		return nil, fmt.Errorf("nothing available right now (try the other pricing mode)")
 	}
 	var typ string
+	// Height keeps a 45-type RunPod catalogue (or a 200-shape Vast one) in a
+	// scrolling viewport instead of one screenful-and-a-half of options; `/`
+	// filters, which is the only sane way through a list that long.
 	if err := run(huh.NewSelect[string]().
-		Title("Instance type (available now)").
+		Title(fmt.Sprintf("Instance type (%d available now, / filters)", len(typeOpts))).
 		Options(typeOpts...).Value(&typ).Height(18)); err != nil {
 		return nil, abortToNil(err)
 	}
@@ -78,7 +89,7 @@ func Picker(ctx context.Context, a *core.App) (*core.UpSpec, error) {
 		for _, l := range locs {
 			opts = append(opts, huh.NewOption(l, l))
 		}
-		if err := run(huh.NewSelect[string]().Title("Datacenter").Options(opts...).Value(&loc)); err != nil {
+		if err := run(huh.NewSelect[string]().Title("Datacenter").Options(opts...).Value(&loc).Height(14)); err != nil {
 			return nil, abortToNil(err)
 		}
 	}
@@ -110,9 +121,13 @@ func Picker(ctx context.Context, a *core.App) (*core.UpSpec, error) {
 		image = sel
 	}
 
-	volSpec, err := pickVolume(ctx, a, loc)
-	if err != nil {
-		return nil, err
+	// A cloud without persistent volumes is not asked for one: its
+	// ListVolumes answers ErrUnsupported, which would abort the picker.
+	var volSpec *config.VolumeSpec
+	if caps.Volumes {
+		if volSpec, err = pickVolume(ctx, a, loc); err != nil {
+			return nil, err
+		}
 	}
 
 	name := "adhoc"
@@ -168,7 +183,7 @@ func pickVolume(ctx context.Context, a *core.App, loc string) (*config.VolumeSpe
 	choice := ""
 	if err := run(huh.NewSelect[string]().
 		Title(fmt.Sprintf("Persistent volume in %s", loc)).
-		Options(opts...).Value(&choice)); err != nil {
+		Options(opts...).Value(&choice).Height(14)); err != nil {
 		return nil, abortToNil(err)
 	}
 	switch choice {
@@ -193,6 +208,36 @@ func pickVolume(ctx context.Context, a *core.App, loc string) (*config.VolumeSpe
 		}
 		return nil, fmt.Errorf("volume %q vanished", choice)
 	}
+}
+
+// memText renders system RAM for a picker or table column: a catalogue that
+// does not quote it (RunPod's) reports 0, which reads as a dash, not 0GB.
+func memText(gb int) string {
+	if gb == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%dGB", gb)
+}
+
+// clip shortens s to n display columns so one long provider string cannot
+// push every column after it off the line.
+func clip(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
+}
+
+// locsText names where a type is available, compactly: the whole list when it
+// is short, else the first location and how many more — Vast reports one GPU
+// in twenty countries whose names are "United States, US".
+func locsText(locs []string) string {
+	joined := strings.Join(locs, ",")
+	if len(locs) > 1 && len(joined) > 18 {
+		joined = fmt.Sprintf("%s +%d", locs[0], len(locs)-1)
+	}
+	return "[" + clip(joined, 20) + "]"
 }
 
 func run(fields ...huh.Field) error {

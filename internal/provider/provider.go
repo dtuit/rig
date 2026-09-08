@@ -39,6 +39,10 @@ type Capabilities struct {
 	Spot    bool // spot-priced instances
 	Volumes bool // persistent data volumes
 	Balance bool // account balance query
+	// DockerImages means an image is any Docker reference the cloud can
+	// pull, so Images lists only the default and configured ones and
+	// `rig images` says so rather than pretending the list is exhaustive.
+	DockerImages bool
 	// SelfStop is the shell line the on-instance TTL watchdog runs at the
 	// deadline to stop the instance. Empty means the VM default,
 	// `shutdown -h now`; a container driver supplies the call that stops

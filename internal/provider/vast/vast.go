@@ -122,7 +122,7 @@ func New(apiKey string, cfg Config) *Driver {
 func (d *Driver) Name() string { return "vast" }
 
 func (d *Driver) Capabilities() provider.Capabilities {
-	return provider.Capabilities{Spot: true, Volumes: false, Balance: true, SelfStop: selfStop}
+	return provider.Capabilities{Spot: true, Volumes: false, Balance: true, DockerImages: true, SelfStop: selfStop}
 }
 
 // Locations are the distinct geolocation strings hosts currently advertise,
