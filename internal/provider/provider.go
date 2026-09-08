@@ -34,11 +34,17 @@ var ErrUnsupported = errors.New("unsupported by provider")
 
 // Capabilities reports which optional features a driver implements, so core
 // can refuse a request it knows the cloud cannot honour before spending a
-// call on it.
+// call on it, and how the footprint stops an instance of this cloud.
 type Capabilities struct {
 	Spot    bool // spot-priced instances
 	Volumes bool // persistent data volumes
 	Balance bool // account balance query
+	// SelfStop is the shell line the on-instance TTL watchdog runs at the
+	// deadline to stop the instance. Empty means the VM default,
+	// `shutdown -h now`; a container driver supplies the call that stops
+	// its own container using only the instance-scoped token the provider
+	// injects (ADR-0003). Trusted driver text, not user input.
+	SelfStop string
 }
 
 // Endpoint is where an instance's sshd answers. VMs report their IP on port

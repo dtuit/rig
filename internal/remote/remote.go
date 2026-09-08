@@ -15,11 +15,19 @@ import (
 
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// ttlSelfStopPlaceholder marks where the provider's stop line goes in ttlScript.
+const ttlSelfStopPlaceholder = "@RIG_SELF_STOP@"
+
+// DefaultSelfStop stops a VM at its deadline; a container provider supplies
+// its own line through provider.Capabilities.SelfStop.
+const DefaultSelfStop = "shutdown -h now"
+
 const ttlScript = `#!/usr/bin/env bash
-# rig TTL watchdog: shuts the instance down at the deadline in $RIG_DIR/deadline
+# rig TTL watchdog: stops the instance at the deadline in $RIG_DIR/deadline
 # (unix epoch). Deferred 1h at a time while busy: any rig-* tmux session alive
-# (any user's socket; this runs under systemd as root), or any executable hook
-# in $RIG_DIR/busy.d exiting 0.
+# (any user's socket; this runs as root, under systemd on a VM or under
+# nohup/setsid in a container), or any executable hook in $RIG_DIR/busy.d
+# exiting 0.
 set -u
 DIR="${RIG_DIR:-${HOME:-/root}/.rig}"
 rig_jobs_running() {
@@ -50,9 +58,18 @@ while true; do
     continue
   fi
   logger -t rig-ttl "deadline reached, shutting down" 2>/dev/null || true
-  shutdown -h now
+  ` + ttlSelfStopPlaceholder + `
 done
 `
+
+// RenderTTLScript returns ~/.rig/ttl.sh with selfStop as the line the
+// watchdog runs at the deadline; empty means DefaultSelfStop. Pure.
+func RenderTTLScript(selfStop string) string {
+	if selfStop == "" {
+		selfStop = DefaultSelfStop
+	}
+	return strings.Replace(ttlScript, ttlSelfStopPlaceholder, selfStop, 1)
+}
 
 const ttlUnit = `[Unit]
 Description=rig TTL self-destruct watchdog
@@ -67,6 +84,32 @@ RestartSec=10
 WantedBy=multi-user.target
 `
 
+// Without systemd the watchdog is a detached process: nohup/setsid so the
+// ssh session's end does not take it, its pid in ~/.rig/ttl.pid so Init
+// and onstart.sh can tell a live watchdog from a stale file.
+const (
+	ttlStartLine = "nohup setsid ~/.rig/ttl.sh >~/.rig/ttl.log 2>&1 & echo $! > ~/.rig/ttl.pid"
+	// ttlAliveCheck sets p to the recorded pid and succeeds only when that
+	// pid is still our ttl.sh (a container restart recycles pids).
+	ttlAliveCheck = `p=$(cat ~/.rig/ttl.pid 2>/dev/null); [ -n "$p" ] && grep -qa ttl.sh "/proc/$p/cmdline" 2>/dev/null`
+	// ttlRestartCmd is what Init runs without systemd: kill the previous
+	// watchdog if its pid is still ours, then start a fresh one.
+	ttlRestartCmd = "{ " + ttlAliveCheck + " && kill \"$p\"; } 2>/dev/null; " + ttlStartLine
+)
+
+// RenderOnstart returns ~/.rig/onstart.sh, the re-arm hook for container
+// providers, whose instances lose every process on restart. Contract for
+// drivers: wire `[ -f ~/.rig/onstart.sh ] && bash ~/.rig/onstart.sh` into the
+// container's start hook (RunPod args wrapper, Vast onstart). Running it
+// while the watchdog is alive is a no-op. Pure.
+func RenderOnstart() string {
+	return "#!/usr/bin/env bash\n" +
+		"# rig: re-arm the TTL watchdog after a container restart. Drivers run\n" +
+		"# `bash ~/.rig/onstart.sh` from the container's start hook when it exists.\n" +
+		ttlAliveCheck + " && exit 0\n" +
+		ttlStartLine + "\n"
+}
+
 func homeOf(user string) string {
 	if user == "root" {
 		return "/root"
@@ -74,15 +117,56 @@ func homeOf(user string) string {
 	return "/home/" + user
 }
 
-// Init creates the ~/.rig layout, installs the TTL watchdog as a systemd
-// unit, and sets the initial deadline.
-func Init(t sshx.Target, ttl time.Duration) error {
+// Footprint is what Init installs beyond the ~/.rig layout.
+type Footprint struct {
+	TTL time.Duration // initial deadline, from now
+	// SelfStop is the shell line the watchdog runs at the deadline; empty
+	// means DefaultSelfStop (a VM). Container drivers supply theirs via
+	// provider.Capabilities.SelfStop.
+	SelfStop string
+	// Log receives warnings Init does not fail on (missing tmux/rsync); nil
+	// discards them.
+	Log func(format string, a ...any)
+}
+
+func (f Footprint) logf(format string, a ...any) {
+	if f.Log != nil {
+		f.Log(format, a...)
+	}
+}
+
+// Init creates the ~/.rig layout, installs the TTL watchdog and sets the
+// initial deadline. With systemd (/run/systemd/system present) the watchdog
+// is a systemd unit; otherwise — a container — ttl.sh runs under
+// nohup/setsid with its pid in ~/.rig/ttl.pid, and ~/.rig/onstart.sh
+// re-arms it after a restart. Init is idempotent: a previous watchdog is
+// restarted, not duplicated. Missing tmux/rsync are installed via apt when
+// possible; failure there is a warning, never an error.
+func Init(t sshx.Target, f Footprint) error {
 	if _, err := t.Run("mkdir -p ~/.rig/busy.d ~/.rig/logs ~/.rig/jobs ~/.rig/env"); err != nil {
 		return fmt.Errorf("creating ~/.rig: %w", err)
 	}
-	if out, err := t.RunWithStdin(ttlScript, "cat > ~/.rig/ttl.sh && chmod +x ~/.rig/ttl.sh"); err != nil {
+	ensureTools(t, f)
+	if out, err := t.RunWithStdin(RenderTTLScript(f.SelfStop), "cat > ~/.rig/ttl.sh && chmod +x ~/.rig/ttl.sh"); err != nil {
 		return fmt.Errorf("installing ttl.sh: %v: %s", err, out)
 	}
+	out, err := t.Run("[ -d /run/systemd/system ] && echo systemd || echo none")
+	if err != nil {
+		return fmt.Errorf("detecting init system: %v: %s", err, out)
+	}
+	// last line: an image's login banner may precede the answer
+	if lines := strings.Fields(out); len(lines) > 0 && lines[len(lines)-1] == "systemd" {
+		if err := installUnit(t); err != nil {
+			return err
+		}
+	} else if err := startDetached(t); err != nil {
+		return err
+	}
+	return SetDeadline(t, time.Now().Add(f.TTL))
+}
+
+// installUnit is the systemd path: the unit file, enabled and (re)started.
+func installUnit(t sshx.Target) error {
 	unit := fmt.Sprintf(ttlUnit, homeOf(t.User))
 	install := "cat > /etc/systemd/system/rig-ttl.service && systemctl daemon-reload && systemctl enable rig-ttl.service && systemctl restart rig-ttl.service"
 	cmd := install
@@ -92,7 +176,47 @@ func Init(t sshx.Target, ttl time.Duration) error {
 	if out, err := t.RunWithStdin(unit, cmd); err != nil {
 		return fmt.Errorf("installing rig-ttl unit: %v: %s", err, out)
 	}
-	return SetDeadline(t, time.Now().Add(ttl))
+	return nil
+}
+
+// startDetached is the no-systemd path: write onstart.sh, kill the previous
+// watchdog if its pid is still ours, start a fresh one under nohup/setsid.
+func startDetached(t sshx.Target) error {
+	if out, err := t.RunWithStdin(RenderOnstart(), "cat > ~/.rig/onstart.sh && chmod +x ~/.rig/onstart.sh"); err != nil {
+		return fmt.Errorf("installing onstart.sh: %v: %s", err, out)
+	}
+	if out, err := t.Run(ttlRestartCmd); err != nil {
+		return fmt.Errorf("starting ttl.sh: %v: %s", err, out)
+	}
+	return nil
+}
+
+// ensureTools installs tmux and rsync via apt when either is missing (root
+// directly, otherwise passwordless sudo) and warns, naming the rig command
+// that needs each, when one is still absent. Best effort: any Docker image
+// with sshd should work, and a failure here must not fail Init.
+func ensureTools(t sshx.Target, f Footprint) {
+	sudo := ""
+	if t.User != "root" {
+		sudo = "sudo -n "
+	}
+	cmd := "command -v tmux >/dev/null && command -v rsync >/dev/null || { command -v apt-get >/dev/null && " +
+		"(" + sudo + "apt-get update -qq && DEBIAN_FRONTEND=noninteractive " + sudo + "apt-get install -y -qq tmux rsync) >/dev/null 2>&1; }; " +
+		`m=""; command -v tmux >/dev/null || m="$m tmux"; command -v rsync >/dev/null || m="$m rsync"; echo "MISSING:$m"`
+	out, err := t.Run(cmd)
+	if err != nil {
+		f.logf("warning: checking for tmux/rsync on the instance: %v: %s", err, strings.TrimSpace(out))
+		return
+	}
+	needs := map[string]string{"tmux": "rig run", "rsync": "rig sync"}
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "MISSING:") {
+			continue
+		}
+		for _, tool := range strings.Fields(strings.TrimPrefix(line, "MISSING:")) {
+			f.logf("warning: %s is not installed on the instance and could not be installed; %s needs it", tool, needs[tool])
+		}
+	}
 }
 
 func SetDeadline(t sshx.Target, deadline time.Time) error {

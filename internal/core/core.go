@@ -480,6 +480,16 @@ func (a *App) discard(ctx context.Context, in *provider.Instance) {
 	}
 }
 
+// footprint is what remote.Init installs for this provider: the TTL and the
+// driver's self-stop line, warnings routed to the App log.
+func (a *App) footprint(ttl time.Duration) remote.Footprint {
+	return remote.Footprint{TTL: ttl, SelfStop: a.Prov.Capabilities().SelfStop, Log: a.logf}
+}
+
+// Footprint is the exported footprint for callers that install it themselves
+// (rig adopt).
+func (a *App) Footprint(ttl time.Duration) remote.Footprint { return a.footprint(ttl) }
+
 // Up runs the whole launch flow and returns the running, initialized instance.
 func (a *App) Up(ctx context.Context, spec UpSpec) (*provider.Instance, error) {
 	in, volumes, err := a.provision(ctx, spec)
@@ -494,7 +504,7 @@ func (a *App) Up(ctx context.Context, spec UpSpec) (*provider.Instance, error) {
 	}
 
 	a.logf("installing TTL watchdog (%s)", spec.TTL)
-	if err := remote.Init(t, spec.TTL); err != nil {
+	if err := remote.Init(t, a.footprint(spec.TTL)); err != nil {
 		return in, fmt.Errorf("remote init: %w", err)
 	}
 

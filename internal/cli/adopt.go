@@ -47,7 +47,7 @@ func newAdoptCmd() *cobra.Command {
 			if err := t.WaitForSSH(5 * time.Minute); err != nil {
 				return err
 			}
-			if err := remote.Init(t, d); err != nil {
+			if err := remote.Init(t, a.Footprint(d)); err != nil {
 				return err
 			}
 			// adopted instances would otherwise be invisible to rig spend
