@@ -1,9 +1,10 @@
 // Package runpod implements provider.Provider against the RunPod REST API v2
-// (https://api.runpod.io/v2) with a hand-written net/http client. Pods are
-// containers: sshd answers on a host-mapped port that changes on every
-// restart, there is no systemd, and the watchdog stops the pod through the
-// pod-scoped key RunPod injects (issue 07). GraphQL is used for exactly one
-// query, the account balance, which v2 does not expose.
+// (https://api.runpod.io/v2) with a hand-written net/http client. Its
+// instances (RunPod calls them pods, and the wire structs here keep that
+// word) are containers: sshd answers on a host-mapped port that changes on
+// every restart, there is no systemd, and the watchdog stops the container
+// through the instance-scoped key RunPod injects (issue 07). GraphQL is used
+// for exactly one query, the account balance, which v2 does not expose.
 package runpod
 
 import (
@@ -38,16 +39,16 @@ const (
 	DefaultDiskGB = 20
 	// MinVolumeGB is RunPod's floor for a network volume.
 	MinVolumeGB = 10
-	// MountPath is where a data volume appears inside the pod.
+	// MountPath is where a data volume appears inside the container.
 	MountPath = "/workspace"
 	// AnyLocation is the location code for "let the scheduler choose".
 	// Community-cloud stock is not tied to a datacenter, so its availability
 	// is reported under this code and a create in it omits dataCenterIds.
 	AnyLocation = "any"
 
-	// SelfStop is the watchdog's deadline line, verified on a real pod
-	// (issue 07): the pod-scoped key lives in /etc/rp_environment, not in an
-	// ssh session's environment.
+	// SelfStop is the watchdog's deadline line, verified on a real instance
+	// (issue 07): the instance-scoped key lives in /etc/rp_environment, not
+	// in an ssh session's environment.
 	SelfStop = `. /etc/rp_environment && curl -fsS -X POST "https://api.runpod.io/v2/pods/$RUNPOD_POD_ID/action" -H "Authorization: Bearer $RUNPOD_API_KEY" -H 'Content-Type: application/json' -d '{"action":"stop"}'`
 
 	// onstartArgs replaces the official image's CMD (/start.sh) so the
@@ -79,9 +80,17 @@ func init() {
 	})
 }
 
-// credential resolves the API key under either accepted name; the error is
-// the first name's, so the user sees the documented spelling.
+// credential resolves the API key under either accepted name, environment
+// before credentials file for both spellings: config.Creds resolves one name
+// env-then-file, so asking it per name would let a file entry beat a
+// variable that is set. The error is the first name's, so the user sees the
+// documented spelling.
 func credential(cfg config.ProviderConfig) (string, error) {
+	for _, n := range envNames {
+		if v := os.Getenv(n); v != "" {
+			return v, nil
+		}
+	}
 	var first error
 	for _, n := range envNames {
 		creds, err := cfg.Creds([]string{n})
@@ -214,7 +223,8 @@ func (d *Driver) price(g gpuType) float64 {
 	return g.Price.Secure
 }
 
-// counts are the GPU counts rig offers as types, capped by the pod maximum.
+// counts are the GPU counts rig offers as types, capped by the catalogue's
+// maximum for one instance.
 func counts(max int) []int {
 	var out []int
 	for _, n := range []int{1, 2, 4, 8} {
@@ -226,7 +236,8 @@ func counts(max int) []int {
 }
 
 // catalog fetches the GPU catalogue with live availability for the
-// configured cloud and refreshes the id -> name map pods are rendered with.
+// configured cloud and refreshes the id -> name map instances are rendered
+// with.
 func (d *Driver) catalog(ctx context.Context) ([]gpuType, error) {
 	var resp struct {
 		GPUs []gpuType `json:"gpus"`
@@ -352,13 +363,15 @@ func (d *Driver) Images(context.Context, string) ([]provider.Image, error) {
 	return out, nil
 }
 
-// --- pods ------------------------------------------------------------------
+// --- instances -------------------------------------------------------------
 
 type sshEndpoint struct {
 	Host string `json:"host"`
 	Port int    `json:"port"`
 }
 
+// pod is the v2 wire shape of an instance; "pod" is RunPod's word for one,
+// kept here (and in the JSON tags) because that is what the API sends.
 type pod struct {
 	ID           string  `json:"id"`
 	Name         string  `json:"name"`
@@ -389,7 +402,7 @@ type pod struct {
 	} `json:"ssh"`
 }
 
-// endpoint is where the pod's sshd is reachable: the published direct
+// endpoint is where the instance's sshd is reachable: the published direct
 // mapping when RunPod has resolved it, else the raw 22/tcp runtime port.
 func (p *pod) endpoint() provider.Endpoint {
 	ep := provider.Endpoint{User: "root"}
@@ -408,8 +421,8 @@ func (p *pod) endpoint() provider.Endpoint {
 	return ep
 }
 
-// status maps the v2 lifecycle words onto provider.Status. A RUNNING pod
-// whose ssh port is not yet published is still provisioning as far as rig
+// status maps the v2 lifecycle words onto provider.Status. A RUNNING
+// instance whose ssh port is not published yet is still provisioning as rig
 // is concerned: nothing can connect to it.
 func status(raw string, ep provider.Endpoint) provider.Status {
 	switch raw {
@@ -491,7 +504,8 @@ func (d *Driver) listPods(ctx context.Context) ([]pod, error) {
 	return resp.Pods, nil
 }
 
-// ListInstances returns the account's rig- pods; other pods are not rig's.
+// ListInstances returns the account's rig- instances; anything else in the
+// account is not rig's.
 func (d *Driver) ListInstances(ctx context.Context) ([]provider.Instance, error) {
 	pods, err := d.listPods(ctx)
 	if err != nil {
@@ -507,8 +521,8 @@ func (d *Driver) ListInstances(ctx context.Context) ([]provider.Instance, error)
 	return out, nil
 }
 
-// GetInstance reports a pod RunPod no longer knows as Gone rather than
-// erroring: a terminated pod disappears from the API.
+// GetInstance reports an instance RunPod no longer knows as Gone rather
+// than erroring: a terminated instance disappears from the API.
 func (d *Driver) GetInstance(ctx context.Context, id string) (*provider.Instance, error) {
 	var p pod
 	if _, err := d.do(ctx, http.MethodGet, "/pods/"+id, nil, &p); err != nil {
@@ -524,7 +538,7 @@ func (d *Driver) GetInstance(ctx context.Context, id string) (*provider.Instance
 
 func (d *Driver) CreateInstance(ctx context.Context, req provider.CreateInstanceRequest) (*provider.Instance, error) {
 	if req.Spot {
-		return nil, fmt.Errorf("runpod v2 has no spot pods: %w", provider.ErrUnsupported)
+		return nil, fmt.Errorf("runpod v2 has no spot instances: %w", provider.ErrUnsupported)
 	}
 	n, name, err := parseToken(req.Type)
 	if err != nil {
@@ -574,6 +588,8 @@ func (d *Driver) CreateInstance(ctx context.Context, req provider.CreateInstance
 	}
 	if strings.HasPrefix(image, "runpod/") {
 		body["args"] = onstartArgs
+	} else {
+		d.logf("image %s is not a runpod/* image, so rig leaves its entrypoint alone: the TTL watchdog will not re-arm if this instance restarts — run `rig adopt %s` after any restart", image, req.Name)
 	}
 	var p pod
 	if _, err := d.do(ctx, http.MethodPost, "/pods", body, &p); err != nil {
@@ -592,9 +608,9 @@ func (d *Driver) action(ctx context.Context, id, action string) error {
 	return err
 }
 
-// DeleteInstance terminates the pod (a pod already gone counts as done) and
-// then deletes the requested network volumes, retrying briefly while RunPod
-// still sees them mounted on the terminating pod.
+// DeleteInstance terminates the instance (one already gone counts as done)
+// and then deletes the requested network volumes, retrying briefly while
+// RunPod still sees them mounted on the terminating instance.
 func (d *Driver) DeleteInstance(ctx context.Context, id string, deleteVolumeIDs []string) error {
 	if err := d.action(ctx, id, "terminate"); err != nil {
 		var ae *apiError
@@ -639,8 +655,8 @@ type networkVolume struct {
 	Type       string `json:"type"`
 }
 
-// mountedOn maps volume id -> ids of pods (not terminated) that mount it;
-// the volume API itself does not say.
+// mountedOn maps volume id -> ids of the instances (not terminated) that
+// mount it; the volume API itself does not say.
 func (d *Driver) mountedOn(ctx context.Context) (map[string][]string, error) {
 	pods, err := d.listPods(ctx)
 	if err != nil {
@@ -658,9 +674,9 @@ func (d *Driver) mountedOn(ctx context.Context) (map[string][]string, error) {
 	return out, nil
 }
 
-func toVolume(v networkVolume, pods []string) provider.Volume {
+func toVolume(v networkVolume, instanceIDs []string) provider.Volume {
 	st := "available"
-	if len(pods) > 0 {
+	if len(instanceIDs) > 0 {
 		st = "attached"
 	}
 	return provider.Volume{
@@ -670,7 +686,7 @@ func toVolume(v networkVolume, pods []string) provider.Volume {
 		Type:        v.Type,
 		Status:      st,
 		Location:    v.DataCenter,
-		InstanceIDs: pods,
+		InstanceIDs: instanceIDs,
 	}
 }
 
@@ -725,11 +741,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req provider.CreateVolumeRequ
 }
 
 func (d *Driver) AttachVolume(context.Context, string, string) error {
-	return fmt.Errorf("runpod mounts network volumes only when a pod is created: %w", provider.ErrUnsupported)
+	return fmt.Errorf("runpod mounts network volumes only when an instance is created: %w", provider.ErrUnsupported)
 }
 
 func (d *Driver) DetachVolume(context.Context, string, string) error {
-	return fmt.Errorf("runpod mounts network volumes only when a pod is created: %w", provider.ErrUnsupported)
+	return fmt.Errorf("runpod mounts network volumes only when an instance is created: %w", provider.ErrUnsupported)
 }
 
 // DeleteVolume removes the network volume; one already gone counts as done.
@@ -742,14 +758,30 @@ func (d *Driver) DeleteVolume(ctx context.Context, volumeID string) error {
 	return err
 }
 
-// EnsureSSHKey registers nothing: the key rides in the pod's PUBLIC_KEY
+// EnsureSSHKey registers nothing: the key rides in the instance's PUBLIC_KEY
 // environment variable at create, so no account-side key is needed.
 func (d *Driver) EnsureSSHKey(context.Context, string, string) (string, error) {
 	return "", nil
 }
 
-// Balance asks GraphQL for myself.clientBalance, the one query v2 lacks;
-// any failure is reported as unsupported so the dashboard hides the tile.
+// fieldGone recognises the reply that means this API no longer serves
+// myself.clientBalance — the only balance failure that is a capability gap
+// rather than something the user must read (ADR-0007). The query is a
+// constant, so a validation failure on it can only mean the schema moved.
+// Verified live 2026-09-08: an unknown field answers HTTP 400 with
+// `{"errors":[{"message":"Cannot query field \"x\" on type \"User\".",
+// "extensions":{"code":"GRAPHQL_VALIDATION_FAILED"}}]}`.
+func fieldGone(msg string) bool {
+	s := strings.ToLower(msg)
+	return strings.Contains(s, "cannot query field") ||
+		strings.Contains(s, "graphql_validation_failed") ||
+		strings.Contains(s, "unknown field")
+}
+
+// Balance asks GraphQL for myself.clientBalance, the one query v2 lacks.
+// Only a reply that says the field is not served is ErrUnsupported (the
+// dashboard then hides the tile); a rejected key, an HTTP error or a
+// timeout is returned as itself, so the user reads why.
 func (d *Driver) Balance(ctx context.Context) (float64, string, error) {
 	var resp struct {
 		Data struct {
@@ -764,11 +796,22 @@ func (d *Driver) Balance(ctx context.Context) (float64, string, error) {
 	err := d.post(ctx, d.GraphQLURL, "POST graphql", map[string]string{"query": "{ myself { clientBalance } }"}, &resp)
 	switch {
 	case err != nil:
-		return 0, "", fmt.Errorf("runpod balance: %v: %w", err, provider.ErrUnsupported)
+		if fieldGone(err.Error()) {
+			return 0, "", fmt.Errorf("runpod no longer serves myself.clientBalance: %w", provider.ErrUnsupported)
+		}
+		var ae *apiError
+		if errors.As(err, &ae) && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden) {
+			return 0, "", fmt.Errorf("runpod rejected the API key reading the account balance (HTTP %d); check RUNPOD_API_KEY", ae.Status)
+		}
+		return 0, "", fmt.Errorf("reading the runpod account balance: %w", err)
 	case len(resp.Errors) > 0:
-		return 0, "", fmt.Errorf("runpod balance: %s: %w", resp.Errors[0].Message, provider.ErrUnsupported)
+		msg := resp.Errors[0].Message
+		if fieldGone(msg) {
+			return 0, "", fmt.Errorf("runpod no longer serves myself.clientBalance (%s): %w", msg, provider.ErrUnsupported)
+		}
+		return 0, "", fmt.Errorf("reading the runpod account balance: %s", msg)
 	case resp.Data.Myself.ClientBalance == nil:
-		return 0, "", fmt.Errorf("runpod balance: empty reply: %w", provider.ErrUnsupported)
+		return 0, "", fmt.Errorf("runpod reported no account balance: %w", provider.ErrUnsupported)
 	}
 	return *resp.Data.Myself.ClientBalance, "USD", nil
 }

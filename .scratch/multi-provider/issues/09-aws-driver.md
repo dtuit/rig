@@ -26,7 +26,7 @@ Verda, and a create-retry across AZs when capacity is short. Balance is reported
 - [ ] `Images()` = the DLAMI resolved through SSM public parameters (verify the exact path for
       "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04)" during implementation) and a
       plain Ubuntu 24.04 for CPU types; any `ami-…` accepted. Default user `ubuntu`.
-- [ ] `EnsureSSHKey` = `DescribeKeyPairs` by name + fingerprint match, else `ImportKeyPair`.
+- [x] `EnsureSSHKey` = `DescribeKeyPairs` by name + fingerprint match, else `ImportKeyPair`.
 - [x] Networking: default VPC, the subnet in the chosen AZ, security group `rig` (22/tcp from
       0.0.0.0/0, tagged `rig:managed`) created if missing, `AssociatePublicIpAddress: true`.
 - [x] `CreateInstance`: `RunInstances` with tags `Name=rig-<name>`, `rig:managed=true`,
@@ -136,6 +136,7 @@ follow-up; the pricing filter set returns exactly one `RunInstances` product per
 
 **IAM actions used** (for a scoped role later): `ec2:DescribeAvailabilityZones`,
 `DescribeInstanceTypes`, `DescribeInstanceTypeOfferings`, `DescribeSpotPriceHistory`,
+`DescribeImages` (the launch AMI's root device),
 `DescribeKeyPairs`, `ImportKeyPair`, `DescribeVpcs`, `DescribeSubnets`,
 `DescribeSecurityGroups`, `CreateSecurityGroup`, `AuthorizeSecurityGroupIngress`,
 `RunInstances`, `DescribeInstances`, `TerminateInstances`, `StopInstances`, `StartInstances`,
@@ -158,3 +159,54 @@ one `spot: true` launch, and the watchdog firing at the deadline.
 **Follow-ups.** `core.EnsureVolume` logs Verda's `NVMe_Shared` as the default volume type
 name; tighten the security group to the operator's IP; Xen-generation device naming; a
 `--type` outside `families` is not shown by `rig types`.
+
+2026-09-08 (agent, code-review fixes): five defects from the two-axis review, all TDD (red test
+first) in `internal/provider/aws/aws_test.go`.
+
+1. **Root device no longer hardcoded** (`instances.go`). `ec2API` gained `DescribeImages`;
+`rootDeviceName(ctx, ami, sizeGB)` resolves the AMI's own `RootDeviceName` and caches it per AMI
+id in `Driver.rootDevices`, and `CreateInstance` maps the `os_volume_gb` override on that device.
+A lookup that fails or finds no such image falls back to `fallbackRootDevice` (`/dev/sda1`, was
+`rootDevice`) and warns that EC2 will otherwise add a *second* volume of that size which
+`rig down` will not delete. Tests: an AMI rooted at `/dev/xvda` maps `/dev/xvda`, one at
+`/dev/sda1` maps `/dev/sda1`, `DescribeImages` is called once per AMI, and a denied lookup still
+launches with one warning naming the AMI, the assumed device and the risk. The existing
+`TestCreateInstanceRequestShapeAndNetworkOnFirstUse` fake now carries an `ami-0abc` image rooted
+at `/dev/sda1` so it asserts the resolved device rather than the fallback.
+
+2. **Pricing failure is no longer silent** (`aws.go`, `pricing.go`). `Driver.Log
+func(format string, a ...any)` plus `logf` (nil → stderr, `rig: ` prefixed), as on
+`internal/provider/runpod`; the factory needs no wiring because the fallback is already the
+`internal/cli/root.go:stderrLogf` format. `onDemandPrices` warns once — on the same latch that
+sets `pricingDown` — that prices will read 0 and recorded spend will be wrong; the listing still
+succeeds. Test: two `InstanceTypes` calls over two types with a denied Price List produce exactly
+one warning.
+
+3. **`Unsupported` narrowed** (`instances.go`). `createError` maps `Unsupported` to
+`ErrNoCapacity` only when the message names an availability zone (`unsupportedInZone`);
+otherwise it returns `aws: <type> cannot be launched as requested in <zone>: <provider
+message>` so a real misconfiguration is not swallowed by the candidate walk.
+`InsufficientInstanceCapacity` is unconditional as before. Tests cover both branches (the
+existing sentinel test's `Unsupported` message names the AZ, so it is unchanged).
+
+4. **`MaxSpotInstanceCountExceeded` relabelled** (`instances.go`). Its own message: "spot request
+limit reached for <type> in <region>", naming `L-3819A6DF`/`L-7212CCBC` and
+`--desired-value <limit>`; the word vCPU and the vCPU quota codes appear only under
+`VcpuLimitExceeded`. Test asserts both directions.
+
+5. **Key pair fingerprint checked** (`instances.go`). `EnsureSSHKey` compares EC2's
+`KeyFingerprint` against `sshFingerprint(pubkey)` — base64 SHA-256 of the ed25519 public key
+blob, i.e. `ssh-keygen -lf` — accepting the value with or without the `SHA256:` prefix and
+base64 padding. A clear mismatch is an error naming the stale pair and both ways out
+(`aws ec2 delete-key-pair --key-name … --region …`, or point `ssh.public_key` at the key EC2
+holds) instead of launching an instance nobody can ssh into. A fingerprint rig cannot recompute
+(colon-separated hex: MD5 of the DER public key for imported RSA, SHA-1 of the private DER for a
+pair EC2 generated) accepts the name match and warns — the format differences are noted in the
+`sshFingerprint` doc comment. Tests: matching fingerprint reuses silently in all three spellings,
+a different SHA-256 errors and imports nothing, an MD5 fingerprint warns and reuses.
+
+Deliberately left as recorded: spot as one-time + `terminate`; `InstanceTypes` listing families
+only; the two SSM parameter paths (still unverifiable — SSO expired, no live call was possible,
+so every change here is covered by fakes only). Deviation (2) in the entry above (name-only key
+match) no longer applies; the root-device line in "Verify on first live run" is now resolved at
+launch time rather than assumed.

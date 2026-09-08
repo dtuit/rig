@@ -5,6 +5,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -61,6 +62,17 @@ type Endpoint struct {
 	User string `json:"user"`
 }
 
+// String renders the endpoint for a human: the host alone on the default ssh
+// port (0 or 22, as every VM is), host:port for a container's mapped sshd.
+// Every display of an endpoint — `rig status`, `rig tunnel status`, the
+// dashboard — goes through this, so the three read the same.
+func (e Endpoint) String() string {
+	if e.Port == 0 || e.Port == 22 {
+		return e.Host
+	}
+	return fmt.Sprintf("%s:%d", e.Host, e.Port)
+}
+
 // Instance is a provider VM as rig sees it. Status is one of the Status
 // constants (an unknown provider state is passed through verbatim);
 // RawStatus keeps the provider's own status text for display and debugging.
@@ -88,6 +100,17 @@ type Instance struct {
 	Image        string    `json:"image"`
 }
 
+// Endpoint is where rig dials this instance: the ssh endpoint the driver
+// reported, with the display IP standing in as the host for a driver that
+// fills none.
+func (in Instance) Endpoint() Endpoint {
+	e := in.SSH
+	if e.Host == "" {
+		e.Host = in.IP
+	}
+	return e
+}
+
 type InstanceType struct {
 	Type         string  `json:"type"`
 	GPU          string  `json:"gpu"`
@@ -98,6 +121,15 @@ type InstanceType struct {
 	PricePerHour float64 `json:"price_per_hour"`
 	SpotPrice    float64 `json:"spot_price"`
 	Description  string  `json:"description"`
+}
+
+// MemoryText renders system RAM for a human column: a catalogue that does
+// not quote it (RunPod's) reports 0, which reads as a dash, not 0GB.
+func (t InstanceType) MemoryText() string {
+	if t.MemoryGB == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%dGB", t.MemoryGB)
 }
 
 type Volume struct {

@@ -125,7 +125,7 @@ with "rig tunnel stop"; state and logs live beside rig's config.`,
 					fwds = append(fwds, tunnel.Forward{Local: f[0], Remote: f[1]})
 				}
 				t := a.Target(in)
-				ep := tunnel.Endpoint{Instance: in.Name, ID: in.ID, IP: t.Host, Port: t.Port, User: t.User}
+				ep := tunnel.Endpoint{Instance: in.Name, ID: in.ID, Host: t.Host, Port: t.Port, User: t.User}
 				st, already, err := m.Ensure(ep, fwds)
 				if err != nil {
 					return err
@@ -187,10 +187,11 @@ func renderTunnels(states []tunnel.State) error {
 		return nil
 	}
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "INSTANCE\tIP\tFORWARDS\tPHASE\tPID\tAGE")
+	fmt.Fprintln(w, "INSTANCE\tENDPOINT\tFORWARDS\tPHASE\tPID\tAGE")
 	for _, st := range states {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n",
-			strings.TrimPrefix(st.Instance, core.HostPrefix), hostPort(st.IP, st.Port),
+			strings.TrimPrefix(st.Instance, core.HostPrefix),
+			provider.Endpoint{Host: st.Host, Port: st.Port}.String(),
 			forwardsDesc(st), st.Phase, st.PID, age(st.StartedAt))
 	}
 	return w.Flush()
@@ -317,7 +318,7 @@ func newTunnelSuperviseCmd() *cobra.Command {
 				return err
 			}
 			a := &core.App{Cfg: cfg, Log: stderrLogf}
-			in := &provider.Instance{IP: st.IP, SSH: provider.Endpoint{Host: st.IP, Port: st.Port, User: st.User}}
+			in := &provider.Instance{IP: st.Host, SSH: provider.Endpoint{Host: st.Host, Port: st.Port, User: st.User}}
 			return tunnel.Supervise(tunnel.Dir(), st, a.Target(in))
 		},
 	}

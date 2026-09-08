@@ -38,20 +38,22 @@ type reply struct {
 }
 
 // server is a scripted RunPod API: routes map "METHOD /path" to a reply,
-// and every request body is recorded under the same key.
+// and every request body and query string is recorded under the same key.
 type server struct {
-	t      *testing.T
-	routes map[string]reply
-	bodies map[string][]map[string]any
-	auth   []string
+	t       *testing.T
+	routes  map[string]reply
+	bodies  map[string][]map[string]any
+	queries map[string][]string
+	auth    []string
 	*httptest.Server
 }
 
 func newServer(t *testing.T, routes map[string]reply) *server {
-	s := &server{t: t, routes: routes, bodies: map[string][]map[string]any{}}
+	s := &server{t: t, routes: routes, bodies: map[string][]map[string]any{}, queries: map[string][]string{}}
 	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := r.Method + " " + r.URL.Path
 		s.auth = append(s.auth, r.Header.Get("Authorization"))
+		s.queries[key] = append(s.queries[key], r.URL.RawQuery)
 		if b, _ := io.ReadAll(r.Body); len(b) > 0 {
 			var m map[string]any
 			if err := json.Unmarshal(b, &m); err != nil {
@@ -131,6 +133,29 @@ func TestInstanceTypesAreCountTokensPricedPerGPU(t *testing.T) {
 	for _, absent := range []string{"16xPRO-6000-MIG-24GB", "3xRTX-4090", "1xunknown"} {
 		if _, found := typeByName(types, absent); found {
 			t.Errorf("%s should not be offered", absent)
+		}
+	}
+}
+
+// The catalogue query decides which prices and stock RunPod reports, so it
+// is pinned literally: availability included, instances (product POD, not
+// serverless), and the
+// configured cloud.
+func TestCatalogQueryPinsAvailabilityProductAndCloud(t *testing.T) {
+	for _, c := range []struct {
+		cloud   string
+		fixture string
+		want    string
+	}{
+		{"", "gpus-secure.json", "include=AVAILABILITY&product=POD&count=1&cloud=SECURE"},
+		{"community", "gpus-community.json", "include=AVAILABILITY&product=POD&count=1&cloud=COMMUNITY"},
+	} {
+		s := newServer(t, map[string]reply{"GET /catalog/gpus": ok(fixture(t, c.fixture))})
+		if _, err := s.driver(t, runpod.Options{Cloud: c.cloud}).InstanceTypes(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if got := s.queries["GET /catalog/gpus"]; len(got) != 1 || got[0] != c.want {
+			t.Errorf("cloud %q: catalogue query = %v, want [%s]", c.cloud, got, c.want)
 		}
 	}
 }
@@ -359,7 +384,7 @@ func TestCreateInstanceRefusesSpotAndUnknownTypes(t *testing.T) {
 	}
 }
 
-func TestGetInstanceMapsRunningPod(t *testing.T) {
+func TestGetInstanceMapsRunningInstance(t *testing.T) {
 	s := newServer(t, map[string]reply{
 		"GET /catalog/gpus":        ok(fixture(t, "gpus-secure.json")),
 		"GET /pods/9wxg5cwn7lhd2t": ok(fixture(t, "pod-running.json")),
@@ -370,7 +395,7 @@ func TestGetInstanceMapsRunningPod(t *testing.T) {
 	}
 	want := provider.Endpoint{Host: "213.192.2.92", Port: 40076, User: "root"}
 	if in.Status != provider.Running || in.RawStatus != "RUNNING" || in.SSH != want || in.IP != "213.192.2.92" {
-		t.Errorf("running pod = %+v", in)
+		t.Errorf("running instance = %+v", in)
 	}
 	if in.Type != "1xRTX-3090" || in.GPU != "NVIDIA GeForce RTX 3090" || in.Location != "EU-CZ-1" || in.PricePerHour != 0.5 {
 		t.Errorf("type/gpu/location/price = %s %s %s %v", in.Type, in.GPU, in.Location, in.PricePerHour)
@@ -424,7 +449,7 @@ func TestGetInstanceTerminatedIsGone(t *testing.T) {
 	}
 }
 
-func TestListInstancesKeepsOnlyRigPods(t *testing.T) {
+func TestListInstancesKeepsOnlyRigInstances(t *testing.T) {
 	running := string(fixture(t, "pod-running.json"))
 	other := strings.Replace(strings.Replace(running, `"rig-smoke"`, `"jupyter-playground"`, 1), `"9wxg5cwn7lhd2t"`, `"other1"`, 1)
 	list := `{"pods":[` + running + `,` + other + `]}`
@@ -476,7 +501,7 @@ func TestDeleteInstanceGoneAlreadyIsSuccess(t *testing.T) {
 		"POST /pods/p/action": code(http.StatusNotFound, fixture(t, "pod-notfound.json")),
 	})
 	if err := s.driver(t, runpod.Options{}).DeleteInstance(t.Context(), "p", nil); err != nil {
-		t.Errorf("terminate of a missing pod = %v, want nil", err)
+		t.Errorf("terminate of a missing instance = %v, want nil", err)
 	}
 }
 
@@ -491,7 +516,7 @@ func TestDeleteInstanceOtherErrorsSurface(t *testing.T) {
 	}
 }
 
-func TestVolumesCarryDatacenterAndMountingPods(t *testing.T) {
+func TestVolumesCarryDatacenterAndMountingInstances(t *testing.T) {
 	s := newServer(t, map[string]reply{
 		"GET /network-volumes": ok(fixture(t, "volumes.json")),
 		"GET /pods":            ok([]byte(`{"pods":[` + string(fixture(t, "pod-running.json")) + `]}`)),
@@ -508,7 +533,7 @@ func TestVolumesCarryDatacenterAndMountingPods(t *testing.T) {
 		t.Errorf("data = %+v", data)
 	}
 	if !data.IsAttached() || !slices.Equal(data.InstanceIDs, []string{"9wxg5cwn7lhd2t"}) || data.Status != "attached" {
-		t.Errorf("data should be attached to the running pod: %+v", data)
+		t.Errorf("data should be attached to the running instance: %+v", data)
 	}
 	if vols[1].IsAttached() || vols[1].Status != "available" || vols[1].Location != "US-TX-3" {
 		t.Errorf("scratch = %+v", vols[1])
@@ -595,15 +620,48 @@ func TestBalanceViaGraphQL(t *testing.T) {
 	}
 }
 
-func TestBalanceFailureIsUnsupported(t *testing.T) {
+// Only a reply that says the balance field itself is gone is a capability
+// gap; a bad key or a broken API is an error the user must be able to read
+// (ADR-0007: no silent degradation).
+func TestBalanceMissingFieldIsUnsupported(t *testing.T) {
+	// The HTTP 400 body is the live shape (2026-09-08 probe with a renamed
+	// field); the 200 one is defensive.
+	validationFailed := []byte(`{"errors":[{"message":"Cannot query field \"clientBalance\" on type \"User\".","locations":[{"line":1,"column":12}],"extensions":{"code":"GRAPHQL_VALIDATION_FAILED"}}]}`)
 	for name, rp := range map[string]reply{
-		"http error":    code(http.StatusUnauthorized, []byte(`{"errors":[{"message":"Unauthorized"}]}`)),
-		"graphql error": ok([]byte(`{"errors":[{"message":"Cannot query field clientBalance"}],"data":null}`)),
+		"field removed":     code(http.StatusBadRequest, validationFailed),
+		"field removed 200": ok(validationFailed),
+		"no balance":        ok([]byte(`{"data":{"myself":{"clientBalance":null}}}`)),
 	} {
 		s := newServer(t, map[string]reply{"POST /graphql": rp})
 		_, _, err := s.driver(t, runpod.Options{}).Balance(t.Context())
 		if !errors.Is(err, provider.ErrUnsupported) {
 			t.Errorf("%s: err = %v, want ErrUnsupported", name, err)
+		}
+	}
+}
+
+func TestBalanceRealFailuresSurfaceAsErrors(t *testing.T) {
+	cases := map[string]struct {
+		rp   reply
+		want string
+	}{
+		"bad key":    {code(http.StatusUnauthorized, []byte(`{"error":{}}`)), "API key"}, // live 401 body
+		"forbidden":  {code(http.StatusForbidden, []byte(`{"error":{}}`)), "API key"},
+		"api down":   {code(http.StatusInternalServerError, []byte(`{"detail":"internal error"}`)), "500"},
+		"api errors": {ok([]byte(`{"errors":[{"message":"Something went wrong. Please try again later"}],"data":null}`)), "Something went wrong"},
+	}
+	for name, c := range cases {
+		s := newServer(t, map[string]reply{"POST /graphql": c.rp})
+		_, _, err := s.driver(t, runpod.Options{}).Balance(t.Context())
+		if err == nil {
+			t.Errorf("%s: err = nil, want an error", name)
+			continue
+		}
+		if errors.Is(err, provider.ErrUnsupported) {
+			t.Errorf("%s: err = %v, want a readable error, not ErrUnsupported", name, err)
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want it to mention %s", name, err, c.want)
 		}
 	}
 }
@@ -640,9 +698,104 @@ func TestRegisteredFactoryAcceptsEitherKeyName(t *testing.T) {
 	}
 }
 
-// pod-running-live.json is the smoke pod exactly as GET /pods returned it on
-// 2026-09-08 (key scrubbed): mounts is {} rather than null when no volume is
-// attached, and runtime.ports carries RunPod's own http port beside 22/tcp.
+// blockWithCredsFile is a providers.runpod block whose credentials_file
+// holds the given KEY=VALUE lines.
+func blockWithCredsFile(t *testing.T, lines string) config.ProviderConfig {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "creds.env")
+	if err := os.WriteFile(path, []byte(lines), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var pc config.ProviderConfig
+	if err := yaml.Unmarshal([]byte("credentials_file: "+path+"\n"), &pc); err != nil {
+		t.Fatal(err)
+	}
+	return pc
+}
+
+// keyOf opens the driver and reports the key it authenticates with, read off
+// the Authorization header of a real request.
+func keyOf(t *testing.T, pc config.ProviderConfig) string {
+	t.Helper()
+	p, err := provider.Open("runpod", pc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newServer(t, map[string]reply{"GET /catalog/datacenters": ok(fixture(t, "datacenters.json"))})
+	d := p.(*runpod.Driver)
+	d.BaseURL = s.URL
+	if _, err := d.Locations(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimPrefix(s.auth[0], "Bearer ")
+}
+
+// Both spellings are accepted, and the environment is consulted for both of
+// them before the credentials file is consulted for either.
+func TestCredentialPrecedenceEnvBeforeFileForBothNames(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     map[string]string
+		file    string
+		wantKey string
+	}{
+		{"env RUNPOD_API_KEY", map[string]string{"RUNPOD_API_KEY": "env-api"}, "", "env-api"},
+		{"env RUNPOD_KEY", map[string]string{"RUNPOD_KEY": "env-team"}, "", "env-team"},
+		{"file RUNPOD_API_KEY", nil, "RUNPOD_API_KEY=file-api\n", "file-api"},
+		{"file RUNPOD_KEY", nil, "RUNPOD_KEY=file-team\n", "file-team"},
+		{"env RUNPOD_KEY beats file RUNPOD_API_KEY", map[string]string{"RUNPOD_KEY": "env-team"}, "RUNPOD_API_KEY=file-api\n", "env-team"},
+		{"env RUNPOD_API_KEY beats file RUNPOD_KEY", map[string]string{"RUNPOD_API_KEY": "env-api"}, "RUNPOD_KEY=file-team\n", "env-api"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("RUNPOD_API_KEY", "")
+			t.Setenv("RUNPOD_KEY", "")
+			for k, v := range c.env {
+				t.Setenv(k, v)
+			}
+			if got := keyOf(t, blockWithCredsFile(t, c.file)); got != c.wantKey {
+				t.Errorf("key = %q, want %q", got, c.wantKey)
+			}
+		})
+	}
+}
+
+// A foreign image keeps its own entrypoint, so the TTL watchdog cannot
+// re-arm itself after a restart; the user has to hear that.
+func TestCreateInstanceWarnsWhenForeignImageSkipsTheRearmHook(t *testing.T) {
+	cases := []struct {
+		image string
+		warn  bool
+	}{
+		{"myorg/trainer:v3", true},
+		{runpod.DefaultImage, false},
+	}
+	for _, c := range cases {
+		s := newServer(t, map[string]reply{
+			"GET /catalog/gpus": ok(fixture(t, "gpus-secure.json")),
+			"POST /pods":        code(http.StatusCreated, fixture(t, "pod-starting.json")),
+		})
+		d := s.driver(t, runpod.Options{Image: c.image})
+		var logged []string
+		d.Log = func(f string, a ...any) { logged = append(logged, fmt.Sprintf(f, a...)) }
+		if _, err := d.CreateInstance(t.Context(), provider.CreateInstanceRequest{Type: "1xRTX-4090", Name: "rig-x"}); err != nil {
+			t.Fatal(err)
+		}
+		warned := false
+		for _, l := range logged {
+			if strings.Contains(l, c.image) && strings.Contains(l, "watchdog") && strings.Contains(l, "rig adopt") {
+				warned = true
+			}
+		}
+		if warned != c.warn {
+			t.Errorf("image %s: logged %v, want a re-arm warning: %v", c.image, logged, c.warn)
+		}
+	}
+}
+
+// pod-running-live.json is the smoke instance exactly as GET /pods returned
+// it on 2026-09-08 (key scrubbed): mounts is {} rather than null when no
+// volume is attached, and runtime.ports carries RunPod's own http port beside 22/tcp.
 func TestGetInstanceMapsLiveCapture(t *testing.T) {
 	s := newServer(t, map[string]reply{
 		"GET /catalog/gpus":        ok(fixture(t, "gpus-secure.json")),
@@ -654,7 +807,7 @@ func TestGetInstanceMapsLiveCapture(t *testing.T) {
 	}
 	want := provider.Endpoint{Host: "213.192.2.102", Port: 40088, User: "root"}
 	if in.Status != provider.Running || in.SSH != want || in.IP != "213.192.2.102" {
-		t.Errorf("live pod = %+v", in)
+		t.Errorf("live instance = %+v", in)
 	}
 	if in.Type != "1xRTX-4090" || in.PricePerHour != 0.74 || in.Location != "EU-CZ-1" || len(in.VolumeIDs) != 0 {
 		t.Errorf("type/price/location/volumes = %s %v %s %v", in.Type, in.PricePerHour, in.Location, in.VolumeIDs)

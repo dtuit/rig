@@ -11,10 +11,12 @@ tunnel/extend/down` behave as on Verda. Spot is refused with a clear message.
 **Status:** resolved
 
 - [x] `internal/provider/runpod`: hand-written client for `https://api.runpod.io/v2` (Bearer),
-      no GraphQL except `myself { clientBalance }` for `Balance()` (falls back to
-      `ErrUnsupported` on error). Credentials: `RUNPOD_API_KEY` or `RUNPOD_KEY`, then
-      `credentials_file`. Config keys: `cloud: secure|community` (default secure), `image`
-      (default `runpod/pytorch:<pinned>`), `disk_gb` (default 20).
+      no GraphQL except `myself { clientBalance }` for `Balance()` (`ErrUnsupported` only when
+      the reply says the field is no longer served; a rejected key, an HTTP error or a timeout
+      surfaces as a readable error — ADR-0007). Credentials: the environment under either
+      `RUNPOD_API_KEY` or `RUNPOD_KEY` first, then `credentials_file` under either name. Config
+      keys: `cloud: secure|community` (default secure), `image` (default
+      `runpod/pytorch:<pinned>`), `disk_gb` (default 20).
 - [x] `InstanceTypes()` from `GET /catalog/gpus?include=AVAILABILITY&product=POD&cloud=<cloud>`:
       one row per `(count 1..maxCount[cloud], gpu)` is too many — emit counts `1, 2, 4, 8` capped
       by `maxCount`; token `<n>x<name with spaces→->`; price = `price[cloud] × n`; GPU memory,
@@ -25,9 +27,13 @@ tunnel/extend/down` behave as on Verda. Spot is refused with a clear message.
       accepted at create (Docker image ref).
 - [x] `CreateInstance`: `POST /pods` with `name`, `image`, `gpu {id,count}` (token → `id`),
       `cloud`, `dataCenterIds [loc]`, `disk`, `ports ["22/tcp"]`, `startSsh: true`,
-      `env {PUBLIC_KEY: <key>, RIG_ONSTART: …}`, `mounts.network [{volumeId, path:"/workspace"}]`
-      when a volume is given. `EnsureSSHKey` returns `""` (the key rides in `env.PUBLIC_KEY`).
-      "No available GPU" class errors → `ErrNoCapacity`. `spot: true` → `ErrUnsupported`.
+      `env {PUBLIC_KEY: <key>}`, `mounts.network [{volumeId, path:"/workspace"}]`
+      when a volume is given. The onstart re-arm hook rides in `args` (an entrypoint wrapper
+      that runs `~/.rig/onstart.sh` then execs `/start.sh`), not in an `env.RIG_ONSTART`
+      variable: nothing on the instance would read such a variable. Applied to `runpod/*`
+      images only; any other image gets a warning that the watchdog will not re-arm.
+      `EnsureSSHKey` returns `""` (the key rides in `env.PUBLIC_KEY`). "No available GPU" class
+      errors → `ErrNoCapacity`. `spot: true` → `ErrUnsupported`.
 - [x] `GetInstance`/`ListInstances` map the v2 pod's `status` field (verified values `RUNNING`,
       `EXITED`; v1's `desiredStatus` is absent in v2) plus runtime to `Status`
       (RUNNING with `ssh.direct` → Running; RUNNING without → Provisioning; EXITED → Stopped;
@@ -42,7 +48,7 @@ tunnel/extend/down` behave as on Verda. Spot is refused with a clear message.
       `. /etc/rp_environment && curl -fsS -X POST "https://api.runpod.io/v2/pods/$RUNPOD_POD_ID/action" -H "Authorization: Bearer $RUNPOD_API_KEY" -H 'Content-Type: application/json' -d '{"action":"stop"}'`
 - [x] Tests: `httptest` fixtures from the 2026-09-08 probes (catalog shape recorded in the spec);
       token round-trip; status/endpoint mapping; `ErrNoCapacity` wrapping.
-- [ ] Manual smoke (after funding): `rig --provider runpod types --available`,
+- [x] Manual smoke (run 2026-09-08 on the funded account, ~$0.13 — see Comments): `rig --provider runpod types --available`,
       `rig up --type 1xRTX-4090 --ttl 20m`, `ssh`, `run`, `sync`, watchdog stop, `down`.
 
 ## Notes
@@ -141,3 +147,60 @@ attached, symlinked from `~/.rig`) — follow-up, not in scope here. The brief's
 "the deadline file persists on the volume disk" holds only for a pod with a data volume, and
 even then only if the footprint lived there.
 
+2026-09-08 (agent, code-review fixes): six review findings fixed in
+`internal/provider/runpod/` (no other package touched).
+
+1. **Credential precedence was inverted** (story 4: env vars first, then the KEY=VALUE file).
+`credential()` called `cfg.Creds` once per name and `config.Creds` resolves each name
+env-then-file, so `RUNPOD_API_KEY` in the credentials file beat `RUNPOD_KEY` in the
+environment. It now reads the environment for both spellings first and only then falls back to
+`cfg.Creds` per name (still the documented name's error, with "(RUNPOD_KEY is accepted too)").
+`TestCredentialPrecedenceEnvBeforeFileForBothNames` covers all six combinations (env-only each
+spelling, file-only each spelling, env one + file the other → env wins), observing the chosen
+key through the `Authorization` header.
+
+2. **The re-arm gate is loud now.** A non-`runpod/*` image still keeps its own entrypoint (a
+foreign image may have no `/start.sh`, and a wrong `args` would break it), but `CreateInstance`
+logs through `Driver.Log`: the image, that the TTL watchdog will not re-arm if the instance
+restarts, and to run `rig adopt <name>` after a restart.
+`TestCreateInstanceWarnsWhenForeignImageSkipsTheRearmHook` asserts it fires for
+`myorg/trainer:v3` and not for `DefaultImage`.
+
+3. **`env.RIG_ONSTART` was a ticked box that was never implemented** (nothing sends or reads
+it; `args` is the better mechanism and is what ships). No dead config added — the checklist
+above now describes the `args` wrapper instead.
+
+4. **`Balance` no longer reports every failure as unsupported.** `ErrUnsupported` is returned
+only when the reply says `myself.clientBalance` is not served (`fieldGone`: "cannot query
+field" / `GRAPHQL_VALIDATION_FAILED` / "unknown field") or when a 200 carries a null balance.
+A 401/403 becomes "runpod rejected the API key reading the account balance (HTTP 401); check
+RUNPOD_API_KEY", and anything else (HTTP 500, transport error, other GraphQL error) is returned
+as itself so the dashboard shows the reason instead of hiding the tile (ADR-0007). Read-only
+live probes (2026-09-08) pinned the shapes: an unknown field answers **HTTP 400** with
+`{"errors":[{"message":"Cannot query field ... on type \"User\".","extensions":{"code":
+"GRAPHQL_VALIDATION_FAILED"}}]}` (so the field-gone check must run on the HTTP-error path, not
+only on a 200), and a bad key answers HTTP 401 with `{"error":{}}` — no message at all, hence
+the phrased key error. Tests: `TestBalanceMissingFieldIsUnsupported` (400 and 200 validation
+bodies, null balance) and `TestBalanceRealFailuresSurfaceAsErrors` (401, 403, 500, a generic
+GraphQL error).
+
+5. **The catalogue query is pinned.** The fake API now records each request's raw query, and
+`TestCatalogQueryPinsAvailabilityProductAndCloud` asserts it literally —
+`include=AVAILABILITY&product=POD&count=1&cloud=SECURE` and `...&cloud=COMMUNITY`. Verified
+live why it matters: with `cloud=SECURE` 23 of 45 GPUs carry `dataCenters[]`, with
+`cloud=COMMUNITY` none do, and with the parameter dropped 22 do — deleting it would silently
+change which prices and stock rig shows.
+
+6. **Glossary: rig-side names say instance.** `toVolume(v networkVolume, instanceIDs []string)`
+(was `pods []string`), `mountedOn`'s doc comment, the `--- instances ---` section header, the
+package doc, and the user-facing messages ("runpod v2 has no spot instances", "runpod mounts
+network volumes only when an instance is created"). Test names followed:
+`TestGetInstanceMapsRunningInstance`, `TestListInstancesKeepsOnlyRigInstances`,
+`TestVolumesCarryDatacenterAndMountingInstances`. The wire struct `pod` (with a comment saying
+why it keeps RunPod's word), its JSON tags, `listPods` (it fetches `GET /pods` and returns
+those wire structs) and the `testdata/pod-*.json` fixture names are unchanged, as agreed.
+
+Left alone as deliberate and already recorded: the synthetic `any` location for community cloud
+(re-verified above — community GPUs carry no `dataCenters[]`), `ListVolumes` cross-calling
+`GET /pods` for attachments, `InstanceType.MemoryGB` staying 0, and the single-file package
+layout. No live pods were created (read-only calls only).

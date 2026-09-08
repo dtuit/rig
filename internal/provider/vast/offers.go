@@ -199,8 +199,10 @@ func (d *Driver) catalogue(ctx context.Context) (*catalogue, error) {
 
 // types folds the crawl into one InstanceType per (num_gpus, gpu_name):
 // the cheapest on-demand offer's price and hardware, the cheapest min_bid as
-// SpotPrice, the offer count as Description. A shape only seen in the bid
-// market gets a row too, priced by its bids. Cheapest first.
+// SpotPrice, the offer count as Description. A shape the crawl only reaches
+// in the bid market gets a row too, priced by the cheapest bid-market
+// dph_total and marked "(bid only)" in Description, because `rig up` without
+// `spot: true` cannot rent it. Cheapest first.
 func (c *catalogue) types() []provider.InstanceType {
 	type key struct {
 		n    int
@@ -208,46 +210,53 @@ func (c *catalogue) types() []provider.InstanceType {
 	}
 	rows := map[key]*provider.InstanceType{}
 	order := []key{}
+	counts := map[key]int{}       // offers behind the row's quoted price
+	hasOnDemand := map[key]bool{} // shapes the on-demand market carries
+	newRow := func(o offer) *provider.InstanceType {
+		return &provider.InstanceType{
+			Type:         token(o.NumGPUs, o.GPUName),
+			GPU:          o.GPUName,
+			GPUCount:     o.NumGPUs,
+			GPUMemoryGB:  int(math.Round(o.GPURAM / 1024)),
+			MemoryGB:     int(math.Round(o.CPURAM / 1024)),
+			CPUCount:     int(math.Round(o.CPUCores)),
+			PricePerHour: o.DPHTotal,
+		}
+	}
 	for _, o := range c.onDemand {
 		k := key{o.NumGPUs, o.GPUName}
 		row, ok := rows[k]
 		if !ok {
-			row = &provider.InstanceType{
-				Type:         token(o.NumGPUs, o.GPUName),
-				GPU:          o.GPUName,
-				GPUCount:     o.NumGPUs,
-				GPUMemoryGB:  int(math.Round(o.GPURAM / 1024)),
-				MemoryGB:     int(math.Round(o.CPURAM / 1024)),
-				CPUCount:     int(math.Round(o.CPUCores)),
-				PricePerHour: o.DPHTotal,
-			}
+			row = newRow(o)
 			rows[k] = row
 			order = append(order, k)
 		}
 		if o.DPHTotal < row.PricePerHour {
 			row.PricePerHour = o.DPHTotal
 		}
-		row.Description = countOffers(row.Description)
+		hasOnDemand[k] = true
+		counts[k]++
 	}
 	for _, o := range c.bid {
 		k := key{o.NumGPUs, o.GPUName}
 		row, ok := rows[k]
 		if !ok {
-			row = &provider.InstanceType{
-				Type:        token(o.NumGPUs, o.GPUName),
-				GPU:         o.GPUName,
-				GPUCount:    o.NumGPUs,
-				GPUMemoryGB: int(math.Round(o.GPURAM / 1024)),
-				MemoryGB:    int(math.Round(o.CPURAM / 1024)),
-				CPUCount:    int(math.Round(o.CPUCores)),
-			}
+			row = newRow(o) // priced by the bid market until an on-demand offer says otherwise
 			rows[k] = row
 			order = append(order, k)
-			row.Description = countOffers(row.Description)
+		}
+		if !hasOnDemand[k] {
+			if o.DPHTotal < row.PricePerHour {
+				row.PricePerHour = o.DPHTotal
+			}
+			counts[k]++
 		}
 		if row.SpotPrice == 0 || o.MinBid < row.SpotPrice {
 			row.SpotPrice = o.MinBid
 		}
+	}
+	for k, row := range rows {
+		row.Description = describeOffers(counts[k], !hasOnDemand[k])
 	}
 	out := make([]provider.InstanceType, 0, len(order))
 	for _, k := range order {
@@ -271,15 +280,15 @@ func priceOf(t provider.InstanceType) float64 {
 	return t.SpotPrice
 }
 
-// countOffers increments an "N offers" description.
-func countOffers(desc string) string {
-	n := 0
-	if desc != "" {
-		fmt.Sscanf(desc, "%d offers", &n)
-	}
-	n++
+// describeOffers renders a row's offer count, saying so when the only
+// offers are bids: an on-demand rental of that shape is not available.
+func describeOffers(n int, bidOnly bool) string {
+	desc := fmt.Sprintf("%d offers", n)
 	if n == 1 {
-		return "1 offer"
+		desc = "1 offer"
 	}
-	return fmt.Sprintf("%d offers", n)
+	if bidOnly {
+		desc += " (bid only)"
+	}
+	return desc
 }

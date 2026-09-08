@@ -35,8 +35,9 @@ func (d *Driver) cachePath() string {
 
 // onDemandPrices answers the on-demand hourly price of each named type from
 // the 24h cache, refreshing the whole region's list when the cache is stale
-// or lacks a type. Prices decorate a listing: a failure leaves them at 0,
-// is not reported, and stops the driver asking again in this process.
+// or lacks a type. Prices decorate a listing, so a Price List failure leaves
+// them at 0 rather than failing `rig types` — but it is warned about once
+// per process, because a 0 price also lands in the spend ledger.
 func (d *Driver) onDemandPrices(ctx context.Context, names []string) map[string]float64 {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -57,6 +58,7 @@ func (d *Driver) onDemandPrices(ctx context.Context, names []string) map[string]
 		got, err := d.fetchPrices(ctx)
 		if err != nil {
 			d.pricingDown = true
+			d.logf("warning: AWS pricing is unavailable (%v); prices show as 0 for the rest of this command and recorded spend for anything launched now will be wrong", err)
 		} else {
 			for _, n := range names {
 				if _, ok := got[n]; !ok {

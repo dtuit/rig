@@ -86,6 +86,7 @@ func init() {
 type ec2API interface {
 	DescribeAvailabilityZones(context.Context, *ec2.DescribeAvailabilityZonesInput, ...func(*ec2.Options)) (*ec2.DescribeAvailabilityZonesOutput, error)
 	DescribeInstanceTypes(context.Context, *ec2.DescribeInstanceTypesInput, ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error)
+	DescribeImages(context.Context, *ec2.DescribeImagesInput, ...func(*ec2.Options)) (*ec2.DescribeImagesOutput, error)
 	DescribeInstanceTypeOfferings(context.Context, *ec2.DescribeInstanceTypeOfferingsInput, ...func(*ec2.Options)) (*ec2.DescribeInstanceTypeOfferingsOutput, error)
 	DescribeSpotPriceHistory(context.Context, *ec2.DescribeSpotPriceHistoryInput, ...func(*ec2.Options)) (*ec2.DescribeSpotPriceHistoryOutput, error)
 	DescribeKeyPairs(context.Context, *ec2.DescribeKeyPairsInput, ...func(*ec2.Options)) (*ec2.DescribeKeyPairsOutput, error)
@@ -123,6 +124,9 @@ type pricingAPI interface {
 type Driver struct {
 	cfg Config
 
+	// Log receives warning lines; nil writes them rig-prefixed to stderr.
+	Log func(format string, a ...any)
+
 	loadMu  sync.Mutex
 	ec2     ec2API
 	ssm     ssmAPI
@@ -136,6 +140,7 @@ type Driver struct {
 	mu          sync.Mutex
 	gpuByType   map[string]string  // filled by InstanceTypes, read by listings
 	network     map[string]network // zone -> subnet and group, per process
+	rootDevices map[string]string  // ami id -> its root device name
 	prices      *priceCache
 	pricingDown bool // the Price List API failed once; stop asking
 	spot        map[string]spotEntry
@@ -157,18 +162,29 @@ func New(cfg Config) *Driver {
 		dir = filepath.Join(base, "rig")
 	}
 	return &Driver{
-		cfg:       cfg,
-		region:    cfg.Region,
-		cacheDir:  dir,
-		poll:      10 * time.Second,
-		now:       time.Now,
-		gpuByType: map[string]string{},
-		network:   map[string]network{},
-		spot:      map[string]spotEntry{},
+		cfg:         cfg,
+		region:      cfg.Region,
+		cacheDir:    dir,
+		poll:        10 * time.Second,
+		now:         time.Now,
+		gpuByType:   map[string]string{},
+		network:     map[string]network{},
+		rootDevices: map[string]string{},
+		spot:        map[string]spotEntry{},
 	}
 }
 
 func (d *Driver) Name() string { return "aws" }
+
+// logf writes one warning line for the CLI user; without a Log it goes to
+// stderr in the same rig-prefixed style the CLI uses.
+func (d *Driver) logf(format string, a ...any) {
+	if d.Log != nil {
+		d.Log(format, a...)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "rig: "+format+"\n", a...)
+}
 
 func (d *Driver) Capabilities() provider.Capabilities {
 	return provider.Capabilities{Spot: true, Volumes: true, Balance: false}

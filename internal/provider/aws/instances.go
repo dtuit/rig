@@ -2,6 +2,8 @@ package aws
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,9 +16,10 @@ import (
 	"github.com/dtuit/rig/internal/provider"
 )
 
-// rootDevice is the root volume's device name on the Ubuntu-based AMIs the
-// driver defaults to; the size override in CreateInstance maps it.
-const rootDevice = "/dev/sda1"
+// fallbackRootDevice is the root volume's device name on the Ubuntu-based
+// AMIs the driver defaults to, used when EC2 will not say what an AMI's
+// root device is.
+const fallbackRootDevice = "/dev/sda1"
 
 // ListInstances is every instance tagged rig:managed, in any state —
 // terminated ones show as Gone until EC2 forgets them.
@@ -150,7 +153,7 @@ func fromEC2Instance(in types.Instance) provider.Instance {
 func splitVolumes(in types.Instance) (root string, data []string) {
 	rootDev := deref(in.RootDeviceName)
 	if rootDev == "" {
-		rootDev = rootDevice
+		rootDev = fallbackRootDevice
 	}
 	for _, m := range in.BlockDeviceMappings {
 		if m.Ebs == nil {
@@ -184,6 +187,48 @@ func fromState(state string, reason *types.StateReason) provider.Status {
 		return provider.Gone
 	}
 	return provider.Status(state)
+}
+
+// rootDeviceName is the AMI's own root device name, cached per AMI id for
+// the process. The os_volume_gb override must map exactly that device: a
+// mapping for any other name is a *new* block device, so EC2 attaches a
+// second EBS volume of that size instead of growing the root one. That
+// volume inherits the launch's rig:managed tag, shows up as a data volume,
+// and so survives `rig down` and bills until someone notices.
+func (d *Driver) rootDeviceName(ctx context.Context, ami string, sizeGB int) string {
+	d.mu.Lock()
+	dev, ok := d.rootDevices[ami]
+	d.mu.Unlock()
+	if ok {
+		return dev
+	}
+	dev, err := d.describeRootDevice(ctx, ami)
+	if err != nil || dev == "" {
+		why := "EC2 does not know that image"
+		if err != nil {
+			why = err.Error()
+		}
+		d.logf("warning: cannot read the root device of %s (%s); mapping the %d GB root volume on %s — if that image roots elsewhere (/dev/xvda, say), EC2 adds a second %d GB volume instead of growing the root one, and rig down will not delete it",
+			ami, why, sizeGB, fallbackRootDevice, sizeGB)
+		return fallbackRootDevice
+	}
+	d.mu.Lock()
+	d.rootDevices[ami] = dev
+	d.mu.Unlock()
+	return dev
+}
+
+func (d *Driver) describeRootDevice(ctx context.Context, ami string) (string, error) {
+	out, err := d.ec2.DescribeImages(ctx, &ec2.DescribeImagesInput{ImageIds: []string{ami}})
+	if err != nil {
+		return "", d.fail("describing image "+ami, err)
+	}
+	for _, img := range out.Images {
+		if deref(img.ImageId) == ami {
+			return deref(img.RootDeviceName), nil
+		}
+	}
+	return "", nil
 }
 
 // network is what a launch in one zone needs: the default VPC's subnet
@@ -281,11 +326,12 @@ func (d *Driver) ensureNetwork(ctx context.Context, zone string) (network, error
 	return n, nil
 }
 
-// EnsureSSHKey imports pubkey as an EC2 key pair named name unless one of
-// that name exists, and returns the name — RunInstances addresses key pairs
-// by name, so that is the id core hands back in SSHKeyIDs. The fingerprint
-// of an existing pair is not compared: a rotated local key under the same
-// name must be removed with `aws ec2 delete-key-pair` first.
+// EnsureSSHKey imports pubkey as an EC2 key pair named name unless a pair
+// of that name already holds the same key, and returns the name —
+// RunInstances addresses key pairs by name, so that is the id core hands
+// back in SSHKeyIDs. A pair of the same name holding a *different* key is
+// an error rather than a launch nobody can ssh into: that is what a rotated
+// ~/.ssh/rig_ed25519 looks like from EC2's side.
 func (d *Driver) EnsureSSHKey(ctx context.Context, name, pubkey string) (string, error) {
 	if err := d.clients(ctx); err != nil {
 		return "", err
@@ -295,9 +341,21 @@ func (d *Driver) EnsureSSHKey(ctx context.Context, name, pubkey string) (string,
 		return "", d.fail("listing key pairs", err)
 	}
 	for _, k := range out.KeyPairs {
-		if deref(k.KeyName) == name {
+		if deref(k.KeyName) != name {
+			continue
+		}
+		have := deref(k.KeyFingerprint)
+		want, ok := sshFingerprint(pubkey)
+		switch {
+		case !ok || !comparableFingerprint(have):
+			d.logf("warning: key pair %q already exists and rig cannot check that it holds the local key (%s); reusing it — if ssh is refused, delete it with: aws ec2 delete-key-pair --key-name %s --region %s",
+				name, reportedFingerprint(k), name, d.region)
+			return name, nil
+		case sameFingerprint(want, have):
 			return name, nil
 		}
+		return "", fmt.Errorf("aws: key pair %q in %s holds a different key (EC2 has %s, the local key is SHA256:%s); delete the stale pair with: aws ec2 delete-key-pair --key-name %s --region %s, or point ssh.public_key at the key EC2 holds",
+			name, d.region, have, strings.TrimRight(want, "="), name, d.region)
 	}
 	_, err = d.ec2.ImportKeyPair(ctx, &ec2.ImportKeyPairInput{
 		KeyName:           sdk.String(name),
@@ -308,6 +366,59 @@ func (d *Driver) EnsureSSHKey(ctx context.Context, name, pubkey string) (string,
 		return "", d.fail(fmt.Sprintf("registering ssh key %q", name), err)
 	}
 	return name, nil
+}
+
+// sshFingerprint is the fingerprint EC2 reports for an *imported* ed25519
+// key: the SHA-256 digest of the public key blob in base64, the same value
+// `ssh-keygen -lf` prints after "SHA256:". EC2 fingerprints differ by key
+// type and by how the pair arrived — an imported RSA public key is the MD5
+// of its DER encoding, a pair EC2 generated itself is the SHA-1 of the
+// private DER — and neither of those can be computed from a public key, so
+// only the imported-ed25519 case is implemented; ok is false for anything
+// else and the caller falls back to the name match.
+func sshFingerprint(pubkey string) (fp string, ok bool) {
+	fields := strings.Fields(pubkey)
+	if len(fields) < 2 || fields[0] != "ssh-ed25519" {
+		return "", false
+	}
+	blob, err := base64.StdEncoding.DecodeString(fields[1])
+	if err != nil {
+		return "", false
+	}
+	sum := sha256.Sum256(blob)
+	return base64.StdEncoding.EncodeToString(sum[:]), true
+}
+
+// reportedFingerprint is what EC2 said about an existing pair, for the
+// warning when rig cannot recompute it.
+func reportedFingerprint(k types.KeyPairInfo) string {
+	have := deref(k.KeyFingerprint)
+	if have == "" {
+		return "EC2 reported no fingerprint"
+	}
+	if k.KeyType == "" {
+		return "EC2 reports " + have
+	}
+	return fmt.Sprintf("EC2 reports %s for a %s key", have, k.KeyType)
+}
+
+// comparableFingerprint says whether what EC2 reported is in the base64
+// SHA-256 shape sshFingerprint produces. The MD5 and SHA-1 fingerprints are
+// colon-separated hex, which rig cannot recompute.
+func comparableFingerprint(reported string) bool {
+	if strings.HasPrefix(reported, "SHA256:") {
+		return true
+	}
+	return reported != "" && !strings.Contains(reported, ":")
+}
+
+// sameFingerprint compares two SHA-256 fingerprints written either way:
+// with or without the "SHA256:" prefix and the base64 padding.
+func sameFingerprint(a, b string) bool {
+	norm := func(s string) string {
+		return strings.TrimRight(strings.TrimPrefix(strings.TrimSpace(s), "SHA256:"), "=")
+	}
+	return norm(a) == norm(b)
 }
 
 // CreateInstance launches one instance in the requested zone: the default
@@ -350,7 +461,7 @@ func (d *Driver) CreateInstance(ctx context.Context, req provider.CreateInstance
 	}
 	if req.OSVolumeGB > 0 {
 		in.BlockDeviceMappings = []types.BlockDeviceMapping{{
-			DeviceName: sdk.String(rootDevice),
+			DeviceName: sdk.String(d.rootDeviceName(ctx, req.Image, req.OSVolumeGB)),
 			Ebs: &types.EbsBlockDevice{
 				VolumeSize:          sdk.Int32(int32(req.OSVolumeGB)),
 				VolumeType:          types.VolumeTypeGp3,
@@ -424,19 +535,47 @@ func quotaFor(instanceType string, spot bool) quota {
 }
 
 // createError turns a RunInstances failure into what core needs: the
-// capacity sentinel for "none right now in this zone", a quota hint for a
-// vCPU limit, and the SSO rewrite for everything else.
+// capacity sentinel for "none right now in this zone", so the candidate
+// walk moves on; a quota hint naming the limit to raise; and the SSO
+// rewrite for everything else.
 func (d *Driver) createError(req provider.CreateInstanceRequest, err error) error {
-	code := errCode(err)
-	switch code {
-	case "InsufficientInstanceCapacity", "Unsupported":
+	noCapacity := func() error {
 		return fmt.Errorf("aws: %s in %s: %s: %w", req.Type, req.Location, errMessage(err), provider.ErrNoCapacity)
-	case "VcpuLimitExceeded", "MaxSpotInstanceCountExceeded":
-		q := quotaFor(req.Type, req.Spot || code == "MaxSpotInstanceCountExceeded")
+	}
+	switch errCode(err) {
+	case "InsufficientInstanceCapacity":
+		return noCapacity()
+	case "Unsupported":
+		// Unsupported covers both "this type is not offered in this zone",
+		// which the next candidate may well satisfy, and configurations EC2
+		// will never accept anywhere in the region. Only the first is a
+		// capacity answer; swallowing the second as "none available" hides
+		// a misconfiguration behind an exhausted candidate walk.
+		if unsupportedInZone(errMessage(err)) {
+			return noCapacity()
+		}
+		return fmt.Errorf("aws: %s cannot be launched as requested in %s: %s", req.Type, req.Location, errMessage(err))
+	case "VcpuLimitExceeded":
+		q := quotaFor(req.Type, req.Spot)
 		return fmt.Errorf("aws: vCPU quota exceeded for %s in %s (%s); request an increase of quota %s (%s): aws service-quotas request-service-quota-increase --service-code ec2 --quota-code %s --desired-value <vcpus>",
+			req.Type, d.region, errMessage(err), q.code, q.name, q.code)
+	case "MaxSpotInstanceCountExceeded":
+		// A separate limit from the vCPU quotas: how many spot instance
+		// requests the account may have running at once.
+		q := quotaFor(req.Type, true)
+		return fmt.Errorf("aws: spot request limit reached for %s in %s (%s); request an increase of quota %s (%s): aws service-quotas request-service-quota-increase --service-code ec2 --quota-code %s --desired-value <limit>",
 			req.Type, d.region, errMessage(err), q.code, q.name, q.code)
 	}
 	return d.fail("creating instance "+req.Name, err)
+}
+
+// unsupportedInZone tells EC2's "type not offered in the Availability Zone
+// you requested" apart from the other Unsupported answers (an unsupported
+// market option, a type that exists in no zone of the region), which name
+// no zone.
+func unsupportedInZone(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "availability zone") || strings.Contains(m, "zone id")
 }
 
 // waitRunning polls until the instance is running, or fails when it is

@@ -19,10 +19,14 @@ import (
 func Picker(ctx context.Context, a *core.App) (*core.UpSpec, error) {
 	caps := a.Prov.Capabilities()
 	spot := false
+	// Every question that shops the catalogue names the cloud it is
+	// shopping — the dashboard's `rig · <provider>` and `rig types`'
+	// `provider: <name>` say it too, and `--provider` or a profile pin can
+	// make it a different one than the config default.
 	// A cloud without spot capacity is not asked which pricing it wants.
 	if caps.Spot {
 		if err := run(huh.NewSelect[bool]().
-			Title("Pricing").
+			Title("Pricing on "+a.Provider()).
 			Options(
 				huh.NewOption("on-demand (stable)", false),
 				huh.NewOption("spot (~65% cheaper, can be preempted)", true),
@@ -63,9 +67,12 @@ func Picker(ctx context.Context, a *core.App) (*core.UpSpec, error) {
 		}
 		// The columns are clipped, not wrapped: a marketplace catalogue's
 		// GPU names, descriptions and location lists are long enough to
-		// push the price off the line otherwise.
-		label := fmt.Sprintf("%-16s %-14s %-6s $%-7.2f %-14s %s",
-			t.Type, clip(gpu, 14), memText(t.MemoryGB), price, clip(t.Description, 14), locsText(locs))
+		// push the price off the line otherwise. The description gets 20
+		// columns because a driver's marker belongs at the end of it —
+		// Vast's "2 offers (bid only)", the shape no on-demand rental can
+		// have — and clipping to 14 cut exactly that away.
+		label := fmt.Sprintf("%-16s %-14s %-6s $%-7.2f %-20s %s",
+			t.Type, clip(gpu, 14), t.MemoryText(), price, clip(t.Description, 20), locsText(locs))
 		typeOpts = append(typeOpts, huh.NewOption(strings.TrimRight(label, " "), t.Type))
 	}
 	if len(typeOpts) == 0 {
@@ -76,7 +83,7 @@ func Picker(ctx context.Context, a *core.App) (*core.UpSpec, error) {
 	// scrolling viewport instead of one screenful-and-a-half of options; `/`
 	// filters, which is the only sane way through a list that long.
 	if err := run(huh.NewSelect[string]().
-		Title(fmt.Sprintf("Instance type (%d available now, / filters)", len(typeOpts))).
+		Title(fmt.Sprintf("Instance type on %s (%d available now, / filters)", a.Provider(), len(typeOpts))).
 		Options(typeOpts...).Value(&typ).Height(18)); err != nil {
 		return nil, abortToNil(err)
 	}
@@ -149,7 +156,8 @@ func Picker(ctx context.Context, a *core.App) (*core.UpSpec, error) {
 		mode = "spot"
 	}
 	ok := false
-	summary := fmt.Sprintf("%s in %s, %s, image %s, volume %s, ttl %s", typ, loc, mode, image, volDesc, ttl)
+	summary := fmt.Sprintf("%s on %s in %s, %s, image %s, volume %s, ttl %s",
+		typ, a.Provider(), loc, mode, image, volDesc, ttl)
 	if err := run(huh.NewConfirm().Title("Create instance?").Description(summary).Value(&ok)); err != nil {
 		return nil, abortToNil(err)
 	}
@@ -208,15 +216,6 @@ func pickVolume(ctx context.Context, a *core.App, loc string) (*config.VolumeSpe
 		}
 		return nil, fmt.Errorf("volume %q vanished", choice)
 	}
-}
-
-// memText renders system RAM for a picker or table column: a catalogue that
-// does not quote it (RunPod's) reports 0, which reads as a dash, not 0GB.
-func memText(gb int) string {
-	if gb == 0 {
-		return "-"
-	}
-	return fmt.Sprintf("%dGB", gb)
 }
 
 // clip shortens s to n display columns so one long provider string cannot

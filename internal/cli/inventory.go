@@ -85,13 +85,21 @@ func newTypesCmd() *cobra.Command {
 					spotStr = fmt.Sprintf("%.2f", r.SpotPrice)
 				}
 				fmt.Fprintf(w, "%s\t%s\t%s\t%.2f\t%s\t%s\n",
-					r.Type, r.GPU, memGB(r.MemoryGB), r.PricePerHour, spotStr, availStr)
+					r.Type, r.GPU, r.MemoryText(), r.PricePerHour, spotStr, availStr)
 			}
 			if err := w.Flush(); err != nil {
 				return err
 			}
 			if unavailable > 0 && !availOnly {
 				fmt.Printf("%d types unavailable now; rig types --available hides them\n", unavailable)
+				// A cloud that sells the same hardware on-demand and by
+				// bid answers availability per market, so a priced row
+				// with no locations is not a contradiction: Vast quotes a
+				// shape whose only offers are bids ("N offers (bid only)"
+				// in the picker) and lists it nowhere here.
+				if hasSpot && !spot {
+					fmt.Println("availability is per market: rig types --spot checks the spot one")
+				}
 			}
 			return nil
 		},

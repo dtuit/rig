@@ -67,6 +67,37 @@ func TestTypesTableDashesUnknownMemoryAndBlanksSpot(t *testing.T) {
 	}
 }
 
+// A price with no availability is unreadable on a cloud that sells the same
+// hardware in two markets — a Vast shape whose only offers are bids is
+// quoted here yet deployable nowhere — so the on-demand table says
+// availability is per market. A cloud with no spot capacity has one market
+// and gets no such line.
+func TestTypesSaysAvailabilityIsPerMarket(t *testing.T) {
+	const hint = "availability is per market: rig types --spot checks the spot one"
+	spotty := &fakeProvider{
+		types: []provider.InstanceType{
+			{Type: "1xRTX-4090", GPU: "RTX 4090", PricePerHour: 0.3, SpotPrice: 0.12, Description: "2 offers (bid only)"},
+		},
+		avail: map[string][]string{},
+	}
+	out := runRig(t, spotty, "types")
+	if !strings.Contains(out, hint) {
+		t.Errorf("no per-market line beside an unavailable priced row:\n%s", out)
+	}
+	if out = runRig(t, spotty, "types", "--spot"); strings.Contains(out, hint) {
+		t.Errorf("--spot is already the other market:\n%s", out)
+	}
+
+	nospot := &fakeProvider{
+		types: []provider.InstanceType{{Type: "1xA100-SXM", GPU: "A100", PricePerHour: 1.74}},
+		avail: map[string][]string{},
+		caps:  &provider.Capabilities{Volumes: true, Balance: true, DockerImages: true},
+	}
+	if out := runRig(t, nospot, "types"); strings.Contains(out, hint) {
+		t.Errorf("a cloud with one market must not offer the other:\n%s", out)
+	}
+}
+
 // On a Docker-image cloud the two rows are only rig's default and whatever
 // the config names, so the table is followed by the standing offer; a cloud
 // with a real image catalogue gets no such hint.

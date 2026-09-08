@@ -68,6 +68,22 @@ func newAppFor(cfg *config.Config, pin string) (*core.App, error) {
 	return app, nil
 }
 
+// configForDisplay is the config for a command that drives no provider:
+// `rig spend` reads the local ledger and must keep working with no
+// credentials at all, so it never opens a driver. A config that will not
+// load is a warning, not a failure — the ledger is still worth printing.
+func configForDisplay() *config.Config {
+	if app != nil {
+		return app.Cfg
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		stderrLogf("warning: reading config: %v", err)
+		return &config.Config{}
+	}
+	return cfg
+}
+
 // stderrLogf is the CLI's shared progress logger: rig-prefixed, on stderr.
 func stderrLogf(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "rig: "+format+"\n", a...)

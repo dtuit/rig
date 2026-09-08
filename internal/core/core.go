@@ -56,7 +56,7 @@ func (a *App) Managed(ctx context.Context) ([]provider.Instance, error) {
 	})
 	// a fresh listing is the one moment stale cache entries can be caught —
 	// this provider's entries; the listing says nothing about other clouds'
-	if err := instcache.Reconcile(instcache.Path(), a.Prov.Name(), out, time.Now()); err != nil {
+	if err := instcache.Reconcile(instcache.Path(), a.Provider(), out, time.Now()); err != nil {
 		a.logf("warning: instance cache: %v", err)
 	}
 	return out, nil
@@ -66,7 +66,7 @@ func (a *App) Managed(ctx context.Context) ([]provider.Instance, error) {
 // name for them, so core does this wherever an instance enters: listings,
 // creates, and the instance a caller hands to Down.
 func (a *App) stamp(in *provider.Instance) {
-	in.Provider = a.Prov.Name()
+	in.Provider = a.Provider()
 }
 
 // Resolve picks an instance by name/ID prefix; with empty key it returns the
@@ -101,7 +101,7 @@ func (a *App) cachedInstances() []provider.Instance {
 	}
 	mine := instances[:0]
 	for _, in := range instances {
-		if in.Provider == a.Prov.Name() {
+		if in.Provider == a.Provider() {
 			mine = append(mine, in)
 		}
 	}
@@ -343,6 +343,9 @@ func orDefault(s, d string) string {
 // Provision is the provider half of Up: it refuses what the driver cannot
 // do, walks the candidate list until an instance is running with an IP, and
 // returns it untouched — no ssh, no footprint, no ledger or cache entry.
+// It is exported as the seam the core tests drive (issue 02): everything Up
+// does that a fake provider can answer, with nothing that needs an
+// instance to ssh into. Production callers use Up; keep it exported.
 func (a *App) Provision(ctx context.Context, spec UpSpec) (*provider.Instance, error) {
 	in, _, err := a.provision(ctx, spec)
 	return in, err
@@ -354,10 +357,10 @@ func (a *App) Provision(ctx context.Context, spec UpSpec) (*provider.Instance, e
 func (a *App) provision(ctx context.Context, spec UpSpec) (*provider.Instance, []string, error) {
 	caps := a.Prov.Capabilities()
 	if spec.Spot && !caps.Spot {
-		return nil, nil, fmt.Errorf("%s does not offer spot instances: %w", a.Prov.Name(), provider.ErrUnsupported)
+		return nil, nil, fmt.Errorf("%s does not offer spot instances: %w", a.Provider(), provider.ErrUnsupported)
 	}
 	if spec.Volume != nil && !caps.Volumes {
-		return nil, nil, fmt.Errorf("%s does not offer data volumes: %w", a.Prov.Name(), provider.ErrUnsupported)
+		return nil, nil, fmt.Errorf("%s does not offer data volumes: %w", a.Provider(), provider.ErrUnsupported)
 	}
 
 	// --name rig-x would otherwise become rig-rig-x (issue 15)
@@ -485,15 +488,12 @@ func (a *App) discard(ctx context.Context, in *provider.Instance) {
 	}
 }
 
-// footprint is what remote.Init installs for this provider: the TTL and the
-// driver's self-stop line, warnings routed to the App log.
-func (a *App) footprint(ttl time.Duration) remote.Footprint {
+// Footprint is what remote.Init installs for this provider: the TTL and the
+// driver's self-stop line, warnings routed to the App log. Exported for the
+// caller that installs it itself (rig adopt); Up uses it too.
+func (a *App) Footprint(ttl time.Duration) remote.Footprint {
 	return remote.Footprint{TTL: ttl, SelfStop: a.Prov.Capabilities().SelfStop, Log: a.logf}
 }
-
-// Footprint is the exported footprint for callers that install it themselves
-// (rig adopt).
-func (a *App) Footprint(ttl time.Duration) remote.Footprint { return a.footprint(ttl) }
 
 // Up runs the whole launch flow and returns the running, initialized instance.
 func (a *App) Up(ctx context.Context, spec UpSpec) (*provider.Instance, error) {
@@ -509,7 +509,7 @@ func (a *App) Up(ctx context.Context, spec UpSpec) (*provider.Instance, error) {
 	}
 
 	a.logf("installing TTL watchdog (%s)", spec.TTL)
-	if err := remote.Init(t, a.footprint(spec.TTL)); err != nil {
+	if err := remote.Init(t, a.Footprint(spec.TTL)); err != nil {
 		return in, fmt.Errorf("remote init: %w", err)
 	}
 

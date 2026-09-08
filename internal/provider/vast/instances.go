@@ -130,8 +130,10 @@ func fromAPI(in *instance) provider.Instance {
 }
 
 // fromAPIStatus maps Vast's actual_status (with intended_status as the
-// tie-breaker) onto provider.Status; an unknown word passes through so it
-// still shows up.
+// tie-breaker) onto provider.Status. Core, the cache and the CLI compare
+// Status against the constants, so a word this driver does not know becomes
+// Error — the safe, visible answer — rather than a value nothing matches;
+// the word itself is kept in Instance.RawStatus for display and debugging.
 func fromAPIStatus(actual, intended string) provider.Status {
 	switch actual {
 	case "running":
@@ -146,7 +148,9 @@ func fromAPIStatus(actual, intended string) provider.Status {
 	case "offline", "unknown":
 		return provider.Error
 	}
-	return provider.Status(actual)
+	// A word this driver has never seen: Error, so the instance is still
+	// visible to every core comparison.
+	return provider.Error
 }
 
 var owner = url.Values{"owner": {"me"}}
@@ -261,10 +265,13 @@ func (d *Driver) CreateInstance(ctx context.Context, req provider.CreateInstance
 	var last error
 	for _, o := range offers {
 		body := map[string]any{
-			"client_id":      "me",
-			"image":          image,
-			"disk":           disk,
-			"label":          req.Name,
+			"client_id": "me",
+			"image":     image,
+			"disk":      disk,
+			"label":     req.Name,
+			// "ssh_direc" is how Vast's own CLI spells it (abbreviated
+			// upstream, not a typo here): direct ssh with the proxy as the
+			// fallback. Do not "correct" it.
 			"runtype":        "ssh_direc ssh_proxy",
 			"env":            map[string]string{"-p 22:22": "1"},
 			"onstart":        onstart,

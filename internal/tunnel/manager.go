@@ -87,7 +87,7 @@ func (m *Manager) Ensure(ep Endpoint, forwards []Forward) (State, bool, error) {
 	}
 
 	// Name reuse after an incomplete down: a tunnel recorded under this
-	// instance's name whose ID/IP no longer match forwards to a recycled
+	// instance's name whose ID or endpoint no longer match forwards to a recycled
 	// address — replace it, never trust it. Wait out the stale supervisor's
 	// death (bounded): its ssh child releases the local ports only then, and
 	// the replacement must not lose that bind race.
@@ -124,7 +124,7 @@ func (m *Manager) Ensure(ep Endpoint, forwards []Forward) (State, bool, error) {
 		}
 		if o.st.ID != ep.ID || o.remote != f.Remote {
 			return State{}, false, fmt.Errorf("local port %d is already forwarded to %s:%d for %s",
-				f.Local, o.st.IP, o.remote, o.st.Instance)
+				f.Local, o.st.Host, o.remote, o.st.Instance)
 		}
 		covering = o.st
 	}

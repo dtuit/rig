@@ -2,28 +2,27 @@ package cli
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"reflect"
+
+	"github.com/dtuit/rig/internal/config"
 )
 
-// hostPort renders an ssh endpoint for a human table: the host alone on the
-// default port (0 or 22, as every VM is), host:port for a container's mapped
-// sshd.
-func hostPort(host string, port int) string {
-	if port == 0 || port == 22 {
-		return host
+// severalProviders reports whether a human table must name each row's
+// provider: true when more than one cloud is in play. One rule, two
+// readings, because the two tables see different halves of it — `rig status`
+// lists one provider's instances at a time, so only the config knows the
+// user drives others, while `rig spend` reads a ledger that outlives a
+// provider block. rowProviders is the provider of every row on screen.
+func severalProviders(cfg *config.Config, rowProviders []string) bool {
+	if cfg != nil && len(cfg.Providers) > 1 {
+		return true
 	}
-	return fmt.Sprintf("%s:%d", host, port)
-}
-
-// memGB renders system RAM for a human table: a catalogue that does not
-// quote it (RunPod's) reports 0, which reads as a dash, not 0GB.
-func memGB(gb int) string {
-	if gb == 0 {
-		return "-"
+	seen := map[string]bool{}
+	for _, p := range rowProviders {
+		seen[p] = true
 	}
-	return fmt.Sprintf("%dGB", gb)
+	return len(seen) > 1
 }
 
 // renderJSON emits v for machine consumption (ADR-0002): the existing structs,

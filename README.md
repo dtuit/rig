@@ -78,6 +78,15 @@ Keys*) and Vast (*Account → API keys*).
 | **ssh**        | `root@IP:22` | container on a host-mapped port, user `root` | mapped port or Vast's proxy host, user `root` | `ubuntu@IP:22` |
 | **Self-stop**  | `shutdown -h now` | pod-scoped key → `POST /pods/{id}/action stop` | `CONTAINER_API_KEY` → `PUT /instances/{id}/ state=stopped` | `shutdown -h now` |
 
+**What has been run for real.** Verda is the cloud rig has driven since its
+first commit, and its columns rest on that use plus the tests around it.
+RunPod was smoke-tested end to end on 2026-09-08 — up, ssh, a job, the
+pod-scoped self-stop, down. The Vast.ai and AWS EC2 columns describe drivers
+that are written and unit-tested against recorded API responses but have
+never talked to the live cloud (no billing method on the Vast account, an
+expired AWS SSO token), so read those two as what rig intends to do, not as
+observed behaviour.
+
 Marketplace type tokens are `<count>x<GPU name with spaces as dashes>`, and
 matching is case-insensitive, so `--type 1xrtx-4090` finds the same offers as
 `--type 1xRTX-4090`. What a cloud cannot do fails loudly rather than quietly:
@@ -99,7 +108,7 @@ rig up train             # headless: first available type from the profile
 rig up --type CPU.4V.16G --name smoke --ttl 1h   # fully ad-hoc
 rig up --type 1H100.80S.32V --env-file ~/secrets/hf.env   # push KEY=VALUE files ad hoc (repeatable)
 
-rig status               # table: status, IP, $/h, age, time-to-self-destruct
+rig status               # table: status, ssh endpoint, $/h, age, time-to-self-destruct
 rig types --available    # what can actually be deployed right now
 rig --provider vast types --available    # shop another cloud without touching config
 rig ssh [-- cmd]         # interactive shell or one-off command (agent forwarded)

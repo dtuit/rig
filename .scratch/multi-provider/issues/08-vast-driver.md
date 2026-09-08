@@ -111,3 +111,44 @@ hostname `label` is also what Vast shows in its console. Manual smoke not run (b
 billing method). `internal/cli/provider_test.go` `TestUnknownProviderNamesRegistered` expects
 `have: testfake, verda` and now sees every registered driver — outside this issue's files; one
 edit once all drivers land.
+
+2026-09-08 (agent, code-review fixes): Four defects from the two-axis review, all in
+`internal/provider/vast/` (tests first, red → green). **(1) Raw status no longer leaks into the
+normalised enum.** `fromAPIStatus` returned `provider.Status(actual)` for an unrecognised word, so
+such an instance matched no core/tui/cli/instcache comparison (spec: "Drivers map; core/tui/cli/
+instcache compare constants") — invisible to `ResolveFresh`'s running check and to the TTL/status
+logic. It now returns `provider.Error` (safe and visible) while `fromAPI` keeps Vast's word in
+`Instance.RawStatus`, as it already did for the mapped words. Fixture: `instances.json` gained
+`rig-odd` (`actual_status: "recreating"`, a word the driver does not map); `instances_found` 7 → 8.
+`TestListInstancesMapsStatusAndEndpoint` now expects 7 rig-labelled instances (was 6) and asserts
+`rig-odd` is `Error`/`"recreating"` — the only existing assertion changed.
+**(2) Bid-only GPU shapes are priced honestly (story 17).** `catalogue.types()` folded the two
+crawls together so a shape the crawl only reaches in the bid market got `PricePerHour` 0 (a `$0.00`
+row a user could act on) and an offer count of 1 whatever the number of bids. `types()` now tracks,
+per shape, whether the on-demand market carries it and how many offers stand behind the row's
+quoted price: a shape in both markets is unchanged (cheapest `dph_total`, on-demand offer count);
+a bid-only shape is priced by its cheapest bid-market `dph_total`, counts its bid offers, and its
+`Description` reads `N offers (bid only)` — on-demand availability is what `rig up` without
+`spot: true` needs, so the row says it cannot serve that. `SpotPrice` is still the cheapest
+`min_bid` for both. `countOffers` (string increment) is replaced by `describeOffers(n, bidOnly)`.
+New fixture `testdata/offers_bid_only.json` — two real bid offers for `2xRTX-5080` (ids 26184983
+North Carolina and 49614257 Latvia, live read-only search 2026-09-08) — appended to the bid market
+by the new `fakeVast.addOffers` helper, so the existing fixtures and their probe-derived expected
+values stay untouched. `TestInstanceTypesBidOnlyShape` asserts `PricePerHour` 0.2817777777777778,
+`SpotPrice` 0.28, `"2 offers (bid only)"`, the hardware, that the row sorts by its real price
+(between `1xRTX-3060` and `1xRTX-4090`, not by the bid floor), and that `1xRTX-4090` (both markets)
+is unchanged at 0.2962962962962963 / `"3 offers"`. Note: no shape is bid-only when queried directly
+(every bid offer is the same machine slice) — bid-only rows come from the crawl's price reach
+(8 × 512 offers), which is exactly what the fixture models.
+**(3) The volumes error no longer cites `.scratch/`.** Now "Vast volumes are machine-bound, so rig
+cannot attach one: copy data with rig sync/rig fetch, or use Vast's cloud sync" (the checkbox above
+still quotes the original wording, including the dropped "see spec follow-up").
+`TestVolumesUnsupported` additionally requires `rig sync` and forbids the word "spec".
+**(4) `runtype "ssh_direc ssh_proxy"`** is upstream's own (abbreviated) spelling, confirmed against
+Vast's CLI source; `instances.go` now carries a comment saying so, so no future reader "fixes" it
+into a bug. Deliberately left alone (recorded above): volumes unsupported across all six methods,
+aborting rather than walking every offer when a create fails for a non-offer-gone reason, the
+512-offer page cap workaround and the 30 s in-process crawl cache, `gpu_ram`/`cpu_ram` ÷ 1024.
+Follow-up for the TUI owner: `internal/tui/picker.go` clips `Description` to 14 columns, so
+`"2 offers (bid only)"` renders as `"2 offers (bid…"`; `rig types` does not print `Description` at
+all, so a bid-only row shows its price with `AVAILABLE` `-` unless `--spot` is passed.

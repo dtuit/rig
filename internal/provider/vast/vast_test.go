@@ -74,6 +74,17 @@ func newFake(t *testing.T) *fakeVast {
 	return f
 }
 
+// addOffers appends a fixture's offers to one market, so a test can model
+// a GPU shape the crawl only reaches there.
+func (f *fakeVast) addOffers(typ, file string) {
+	f.t.Helper()
+	var res struct {
+		Offers []map[string]any `json:"offers"`
+	}
+	loadJSON(f.t, file, &res)
+	f.offers[typ] = append(f.offers[typ], res.Offers...)
+}
+
 func (f *fakeVast) write(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -316,6 +327,38 @@ func TestInstanceTypesGroupOffers(t *testing.T) {
 	}
 }
 
+// A GPU shape the crawl only reaches in the bid market still gets a real
+// price — its cheapest bid-market dph_total, not $0.00 — an honest count of
+// the offers behind that price, and "(bid only)" so the row is not read as
+// on-demand capacity.
+func TestInstanceTypesBidOnlyShape(t *testing.T) {
+	f := newFake(t)
+	f.addOffers("bid", "offers_bid_only.json")
+	p := newTestDriver(t, f, Config{})
+	types, err := p.InstanceTypes(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tokens(types); !reflect.DeepEqual(got, []string{"1xRTX-3060", "2xRTX-5080", "1xRTX-4090", "2xRTX-4090", "1xH100-SXM"}) {
+		t.Errorf("tokens = %v, want the bid-only shape sorted by its real price", got)
+	}
+	bidOnly := typeByToken(t, types, "2xRTX-5080")
+	if !near(bidOnly.PricePerHour, 0.2817777777777778) || !near(bidOnly.SpotPrice, 0.28) {
+		t.Errorf("2xRTX-5080 price %v spot %v, want 0.2817777777777778 / 0.28", bidOnly.PricePerHour, bidOnly.SpotPrice)
+	}
+	if bidOnly.Description != "2 offers (bid only)" {
+		t.Errorf("Description = %q, want \"2 offers (bid only)\"", bidOnly.Description)
+	}
+	if bidOnly.GPU != "RTX 5080" || bidOnly.GPUCount != 2 || bidOnly.GPUMemoryGB != 16 || bidOnly.MemoryGB != 126 || bidOnly.CPUCount != 20 {
+		t.Errorf("2xRTX-5080 hardware = %+v, want RTX 5080 x2, 16GB, 126GB RAM, 20 cores", bidOnly)
+	}
+	// a shape both markets carry is unchanged: on-demand price and count
+	r4090 := typeByToken(t, types, "1xRTX-4090")
+	if !near(r4090.PricePerHour, 0.2962962962962963) || r4090.Description != "3 offers" {
+		t.Errorf("1xRTX-4090 = %+v, want 0.2962962962962963 and 3 offers", r4090)
+	}
+}
+
 // A search page is capped at 512 offers whatever limit is asked for, so the
 // catalogue pages by price; with a page of 3 the expensive end must still
 // be there and prices must still be the cheapest.
@@ -425,7 +468,7 @@ func TestListInstancesMapsStatusAndEndpoint(t *testing.T) {
 	for _, in := range ins {
 		byName[in.Name] = in
 	}
-	if _, ok := byName["jupyter-scratch"]; ok || len(ins) != 6 {
+	if _, ok := byName["jupyter-scratch"]; ok || len(ins) != 7 {
 		t.Errorf("ListInstances kept a non-rig label: %v", byName)
 	}
 	direct := byName["rig-train"]
@@ -455,6 +498,7 @@ func TestListInstancesMapsStatusAndEndpoint(t *testing.T) {
 		"rig-new":     provider.Provisioning, // actual_status null
 		"rig-dead":    provider.Error,        // offline
 		"rig-halting": provider.Stopped,      // running but intended stopped
+		"rig-odd":     provider.Error,        // a word the driver does not map
 	} {
 		if got := byName[name].Status; got != want {
 			t.Errorf("%s status = %s, want %s", name, got, want)
@@ -462,6 +506,11 @@ func TestListInstancesMapsStatusAndEndpoint(t *testing.T) {
 	}
 	if old := byName["rig-old"]; !old.Spot || old.Location != "Hong Kong, HK" {
 		t.Errorf("rig-old = %+v, want spot in Hong Kong", old)
+	}
+	// an unmapped word must not leak into the enum core compares, but the
+	// provider's own word is kept for display
+	if odd := byName["rig-odd"]; odd.Status != provider.Error || odd.RawStatus != "recreating" {
+		t.Errorf("rig-odd = %s/%s, want error/recreating", odd.Status, odd.RawStatus)
 	}
 	if byName["rig-new"].Type != "2xRTX-4090" {
 		t.Errorf("rig-new type = %q", byName["rig-new"].Type)
@@ -670,8 +719,12 @@ func TestVolumesUnsupported(t *testing.T) {
 		"DetachVolume": p.DetachVolume(ctx, "v", "i"),
 		"DeleteVolume": p.DeleteVolume(ctx, "v"),
 	} {
-		if !errors.Is(err, provider.ErrUnsupported) || !strings.Contains(err.Error(), "machine-bound") {
-			t.Errorf("%s = %v, want ErrUnsupported explaining machine-bound volumes", name, err)
+		if !errors.Is(err, provider.ErrUnsupported) || !strings.Contains(err.Error(), "machine-bound") ||
+			!strings.Contains(err.Error(), "rig sync") {
+			t.Errorf("%s = %v, want ErrUnsupported explaining machine-bound volumes and the workaround", name, err)
+		}
+		if strings.Contains(err.Error(), "spec") {
+			t.Errorf("%s = %v, points the user at internal planning notes", name, err)
 		}
 	}
 }

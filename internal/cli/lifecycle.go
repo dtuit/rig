@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -307,15 +308,19 @@ func newStatusCmd() *cobra.Command {
 				fmt.Println("no rig instances")
 				return nil
 			}
-			// the provider column earns its place only once the config
-			// knows more than one cloud
-			several := len(a.Cfg.Providers) > 1
-			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-			if several {
-				fmt.Fprintln(w, "NAME\tPROVIDER\tSTATUS\tTYPE\tIP\tLOC\t$/H\tAGE\tTTL")
-			} else {
-				fmt.Fprintln(w, "NAME\tSTATUS\tTYPE\tIP\tLOC\t$/H\tAGE\tTTL")
+			// the provider column earns its place only once more than
+			// one cloud is in play (severalProviders)
+			provs := make([]string, 0, len(rows))
+			for _, r := range rows {
+				provs = append(provs, r.Instance.Provider)
 			}
+			several := severalProviders(a.Cfg, provs)
+			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+			head := []string{"NAME", "STATUS", "TYPE", "ENDPOINT", "LOC", "$/H", "AGE", "TTL"}
+			if several {
+				head = slices.Insert(head, 1, "PROVIDER")
+			}
+			fmt.Fprintln(w, strings.Join(head, "\t"))
 			var burn float64
 			for _, r := range rows {
 				in := r.Instance
@@ -323,13 +328,14 @@ func newStatusCmd() *cobra.Command {
 				if in.Status == provider.Running {
 					burn += in.PricePerHour
 				}
-				prov := ""
-				if several {
-					prov = in.Provider + "\t"
+				cells := []string{
+					strings.TrimPrefix(in.Name, core.HostPrefix), string(in.Status), in.Type,
+					in.Endpoint().String(), in.Location, price, age(in.CreatedAt), r.TTL,
 				}
-				fmt.Fprintf(w, "%s\t%s%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					strings.TrimPrefix(in.Name, core.HostPrefix), prov, in.Status, in.Type,
-					hostPort(orIP(in), in.SSH.Port), in.Location, price, age(in.CreatedAt), r.TTL)
+				if several {
+					cells = slices.Insert(cells, 1, in.Provider)
+				}
+				fmt.Fprintln(w, strings.Join(cells, "\t"))
 			}
 			w.Flush()
 			if burn > 0 {
@@ -339,14 +345,6 @@ func newStatusCmd() *cobra.Command {
 		},
 	}
 	return cmd
-}
-
-// orIP is the ssh host for display, or the IP for a driver that fills none.
-func orIP(in provider.Instance) string {
-	if in.SSH.Host != "" {
-		return in.SSH.Host
-	}
-	return in.IP
 }
 
 func spotTag(spot bool) string {

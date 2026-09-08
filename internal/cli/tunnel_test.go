@@ -53,7 +53,7 @@ func fakeSupervisor(t *testing.T) int {
 
 func connectedState(instance, id, ip string, pid, local, remote int) tunnel.State {
 	return tunnel.State{
-		Endpoint:  tunnel.Endpoint{Instance: instance, ID: id, IP: ip},
+		Endpoint:  tunnel.Endpoint{Instance: instance, ID: id, Host: ip},
 		Forwards:  []tunnel.Forward{{Local: local, Remote: remote}},
 		PID:       pid,
 		StartedAt: time.Now(),

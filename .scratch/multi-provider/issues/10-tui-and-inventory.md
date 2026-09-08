@@ -83,3 +83,108 @@ still aligned — and a scratch program drove a real `huh` Select of 180 such op
 scrolls at both sizes; at exactly 80 columns a row with two or more locations wraps onto a
 second line (huh wraps the option text, the list does not break), which is the accepted cost of
 keeping the description column. Both were deleted afterwards.
+
+2026-09-08 (agent, code-review fixes): a two-axis review of the multi-provider
+work found eight things in this issue's blast radius; all eight are fixed.
+
+**Triplicated endpoint and duplicated memory rendering → methods on the domain
+types.** `internal/provider/provider.go` gains `Endpoint.String()` (host alone
+on port 0 or 22, `host:port` otherwise), `Instance.Endpoint()` (the ssh
+endpoint, with the display IP standing in as the host for a driver that fills
+none) and `InstanceType.MemoryText()` (`-` for a catalogue that quotes no
+system RAM). `cli.hostPort`, `cli.orIP`, `cli.memGB`, `tui.endpointText` and
+`tui.memText` are deleted; `rig status`, `rig tunnel status`, the dashboard,
+`rig types` and the picker all call the methods, so the five readings cannot
+drift again and `tui` no longer needs to copy what it cannot import. New
+`internal/provider/render_test.go` covers no port, port 22, port 40085, empty
+host, the IP fallback and both memory cases. Renderings are byte-identical
+apart from the column header (below).
+
+**One "more than one provider" rule.** `cli.severalProviders(cfg,
+rowProviders)` in `internal/cli/render.go` is now the only predicate: more
+than one provider block in the config, or more than one provider among the
+rows on screen. `rig status` (`lifecycle.go`) and `rig spend` (`spend.go`)
+both use it, so a user with two provider blocks and one cloud's history sees
+the provider named in both tables instead of a PROVIDER column in one and no
+subtotals in the other. It is the union rather than either half because the
+two tables see different halves of the same question: status lists one
+provider's instances at a time, so only the config knows the user drives
+others (a pure data rule would make its column dead code and drop story 5),
+while spend reads a ledger that outlives a provider block (a pure config rule
+would hide a RunPod pod's cost among Verda's). `rig spend` drives no provider,
+so it takes the config through new `cli.configForDisplay()` — never opening a
+driver, warning rather than failing when the config will not load. New test
+`TestSpendNamesProvidersWhenConfigKnowsSeveral`; the existing single-cloud and
+two-cloud spend tests pass unchanged. Both tables now build their row as a
+`[]string` joined with tabs (`slices.Insert` for the optional PROVIDER cell)
+instead of hiding a `\t` inside a `%s` value: the old form could not
+misalign — tabwriter splits the finished bytes, and a registry provider name
+holds no tab — but the row shape is now visible in the code.
+
+**`%v` where the convention is `%w`.** `internal/remote/remote.go`: the five
+error returns in the hunks this work added or touched — `installing ttl.sh`,
+`detecting init system`, `installing rig-ttl unit`, `installing onstart.sh`,
+`starting ttl.sh` — wrap with `%w`, so `errors.Is`/`errors.As` reach the ssh
+error. Messages are unchanged. The `ensureTools` warning keeps `%v` (it logs,
+it does not return). Follow-up, untouched because it predates this work:
+`SetDeadline`, `PushEnv` and the four job functions still use `%v`.
+
+**The picker names its provider.** `internal/tui/picker.go`: the pricing
+question is `Pricing on <provider>`, the type select is
+`Instance type on <provider> (N available now, / filters)`, and the final
+confirm summary reads `<type> on <provider> in <loc>, ...` — the flow says
+which cloud it is shopping at the start, at the catalogue and at the commit,
+consistent with the dashboard's `rig · <provider>` and `rig types`'
+`provider: <name>`. It matters most when `--provider` or a profile pin makes
+it a cloud other than the config default.
+
+**Dashboard header matches the spec's shape.** `internal/tui/dashboard.go`
+renders `rig · <provider> · <balance>` (dim balance), not a separate
+`"  balance X"` tile; a cloud that cannot report one still shows nothing.
+
+**README honesty.** `README.md` grows a short paragraph under the per-provider
+caveats table saying what has actually been run: Verda is the cloud rig has
+driven since its first commit, RunPod was smoke-tested end to end on
+2026-09-08 including the pod-scoped self-stop, and the Vast.ai and AWS EC2
+columns describe drivers unit-tested against recorded responses that have
+never talked to the live cloud (no Vast billing method, an expired AWS SSO
+token) — intent, not observation. No claim that Verda was re-smoke-tested
+here. `rig status`' README line now says "ssh endpoint" instead of "IP".
+
+**Glossary: the field rig dials is not an "IP".** `internal/tunnel/state.go`'s
+`Endpoint.IP` is now `Endpoint.Host`, keeping `json:"ip"` so tunnel state
+files written before the rename still load — `TestStateFileKeepsTheIPKey`
+loads a pre-rename file through `Manager.List()` and checks a rewrite still
+emits `"ip"`. The user-facing columns are now `ENDPOINT` in `rig status`,
+`rig tunnel status` and the dashboard (they show `host:port`, which no IP
+does). `provider.Instance.IP` keeps its name and json key: it *is* a display
+IP, which the glossary allows.
+
+**Middle Man and dead surface.** `internal/core/core.go`: private `footprint`
+is gone, `Footprint(ttl)` is the only one and `Up` calls it; `a.Prov.Name()`
+inside core is now `a.Provider()` everywhere, so the accessor is used
+consistently rather than bypassed; `Provision`'s doc comment now says outright
+that it is the exported test seam from issue 02 and to keep it exported.
+
+**Vast's bid-only marker (asked for mid-pass by the Vast agent).** The driver
+now describes a shape only the bid market carries as `N offers (bid only)`.
+The picker's description column was 14 wide, which cut exactly the marker, so
+it is 20 wide (`12 offers (bid only)` is 20 characters and survives); the
+widest picker row is now 90 columns rather than 84, so the pre-existing wrap
+at exactly 80 columns hits a little sooner — accepted, same trade as before.
+`rig types` does not print `Description` and should not start: Verda fills it
+too, so a NOTE column would rewrite the Verda table, and sniffing `(bid only)`
+in cli would parse a driver's prose. Instead, when a spot-capable cloud has
+unavailable rows and `--spot` was not given, the table's tail adds
+`availability is per market: rig types --spot checks the spot one` — which
+answers the actual question a priced row with `AVAILABLE -` raises, on every
+provider. New test `TestTypesSaysAvailabilityIsPerMarket`.
+
+Verified: `gofmt -l ./internal ./cmd` silent, `go build ./...`, `go vet ./...`,
+and `go test` green for `internal/{cli,core,remote,tunnel,provider,ledger,
+config,instcache,sshx}`. The dashboard and the picker's type labels were
+checked by a temporary `internal/tui` test that printed `dashModel.View()` and
+the label format for RunPod-, Verda- and Vast-shaped rows (header
+`rig · runpod · 123.45 USD`, balance absent when empty, `ENDPOINT` column
+carrying `213.192.2.102:40085`, `12 offers (bid only)` intact); it was deleted
+afterwards, as the repo unit-tests no TUI.

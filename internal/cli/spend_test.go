@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dtuit/rig/internal/config"
 	"github.com/dtuit/rig/internal/ledger"
 )
 
@@ -66,6 +67,25 @@ func TestSpendGroupsPerProvider(t *testing.T) {
 	out = runRig(t, &fakeProvider{}, "spend", "--json")
 	if !strings.Contains(out, `"provider":"runpod"`) || !strings.Contains(out, `"provider":"verda"`) {
 		t.Errorf("spend --json lines lack provider:\n%s", out)
+	}
+}
+
+// The PROVIDER column and the per-cloud subtotals answer the same question
+// `rig status`' column does — is more than one cloud in play — so a user
+// with two provider blocks and one cloud's history sees the provider named
+// in both tables, not in one.
+func TestSpendNamesProvidersWhenConfigKnowsSeveral(t *testing.T) {
+	seedLedger(t, verdaUp, verdaDown)
+	two := &config.Config{Providers: map[string]config.ProviderConfig{"verda": {}, "runpod": {}}}
+	out := runRigCfg(t, two, &fakeProvider{}, "spend")
+	if !strings.HasPrefix(out, "NAME       PROVIDER  TYPE") {
+		t.Errorf("header lacks the provider column:\n%s", out)
+	}
+	if !strings.Contains(out, "rig-train  verda ") {
+		t.Errorf("row lacks the provider:\n%s", out)
+	}
+	if !strings.HasSuffix(out, "\nverda: $10.92\ntotal: $10.92\n") {
+		t.Errorf("subtotal missing:\n%s", out)
 	}
 }
 

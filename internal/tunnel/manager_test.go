@@ -67,7 +67,7 @@ func (w *fakeWorld) seed(st State) {
 	}
 }
 
-var ep = Endpoint{Instance: "rig-train", ID: "id-1", IP: "10.0.0.5"}
+var ep = Endpoint{Instance: "rig-train", ID: "id-1", Host: "10.0.0.5"}
 
 func fwd(pairs ...[2]int) []Forward {
 	var out []Forward
@@ -135,7 +135,7 @@ func TestEnsureAdditionalPortsLaunchesOnlyMissing(t *testing.T) {
 }
 
 func TestEnsureRefusesConflictingLocalPort(t *testing.T) {
-	other := Endpoint{Instance: "rig-other", ID: "id-2", IP: "10.0.0.6"}
+	other := Endpoint{Instance: "rig-other", ID: "id-2", Host: "10.0.0.6"}
 	for name, holder := range map[string]State{
 		"other instance":        {Endpoint: other, Forwards: fwd([2]int{8000, 8000}), PID: 42, Phase: PhaseConnected},
 		"different remote port": {Endpoint: ep, Forwards: fwd([2]int{8000, 8080}), PID: 42, Phase: PhaseConnected},
@@ -203,7 +203,7 @@ func TestListReapsDeadSupervisors(t *testing.T) {
 	w := newWorld(t)
 	w.alive[42] = true
 	w.seed(State{Endpoint: ep, Forwards: fwd([2]int{8000, 8000}), PID: 42, Phase: PhaseConnected})
-	dead := Endpoint{Instance: "rig-old", ID: "id-9", IP: "10.0.0.9"}
+	dead := Endpoint{Instance: "rig-old", ID: "id-9", Host: "10.0.0.9"}
 	w.seed(State{Endpoint: dead, Forwards: fwd([2]int{7000, 7000}), PID: 41, Phase: PhaseConnected})
 
 	live, err := w.manager().List()
@@ -225,7 +225,7 @@ func TestStopInstanceStopsAllItsTunnels(t *testing.T) {
 	w.alive[42], w.alive[43], w.alive[44] = true, true, true
 	w.seed(State{Endpoint: ep, Forwards: fwd([2]int{8000, 8000}), PID: 42, Phase: PhaseConnected})
 	w.seed(State{Endpoint: ep, Forwards: fwd([2]int{9090, 9090}), PID: 43, Phase: PhaseConnected})
-	other := Endpoint{Instance: "rig-other", ID: "id-2", IP: "10.0.0.6"}
+	other := Endpoint{Instance: "rig-other", ID: "id-2", Host: "10.0.0.6"}
 	w.seed(State{Endpoint: other, Forwards: fwd([2]int{7000, 7000}), PID: 44, Phase: PhaseConnected})
 
 	stopped, err := w.manager().StopInstance("rig-train", nil)
@@ -300,7 +300,7 @@ func TestStopInstanceReportsUnkillableSupervisor(t *testing.T) {
 // launching the replacement while it is still alive loses the bind race.
 func TestEnsureWaitsForStaleSupervisorDeath(t *testing.T) {
 	w := newWorld(t)
-	stale := Endpoint{Instance: "rig-train", ID: "id-old", IP: "10.0.0.99"}
+	stale := Endpoint{Instance: "rig-train", ID: "id-old", Host: "10.0.0.99"}
 	w.seed(State{Endpoint: stale, Forwards: fwd([2]int{8000, 8000}), PID: 42, Phase: PhaseConnected})
 
 	m := w.manager()
@@ -329,13 +329,13 @@ func TestEnsureWaitsForStaleSupervisorDeath(t *testing.T) {
 }
 
 // Accepted invariant (2026-08-21): a live tunnel recorded under this
-// instance's name but with a stale ID/IP (name reuse after an incomplete
-// down) is replaced, not reported already-up — it forwards to a recycled
-// address.
+// instance's name but with a stale ID or endpoint (name reuse after an
+// incomplete down) is replaced, not reported already-up — it forwards to a
+// recycled endpoint.
 func TestEnsureReplacesTunnelWithStaleEndpoint(t *testing.T) {
 	w := newWorld(t)
 	w.alive[42] = true
-	stale := Endpoint{Instance: "rig-train", ID: "id-old", IP: "10.0.0.99"}
+	stale := Endpoint{Instance: "rig-train", ID: "id-old", Host: "10.0.0.99"}
 	w.seed(State{Endpoint: stale, Forwards: fwd([2]int{8000, 8000}), PID: 42, Phase: PhaseConnected})
 	w.onLaunch = w.connectedSupervisor(43)
 
@@ -349,11 +349,11 @@ func TestEnsureReplacesTunnelWithStaleEndpoint(t *testing.T) {
 	if len(w.stopped) != 1 || w.stopped[0] != 42 {
 		t.Errorf("stopped = %v, want the stale supervisor (42)", w.stopped)
 	}
-	if st.PID != 43 || st.IP != "10.0.0.5" {
+	if st.PID != 43 || st.Host != "10.0.0.5" {
 		t.Errorf("state = %+v, want a fresh pid-43 tunnel to 10.0.0.5", st)
 	}
 	live, _ := w.manager().List()
-	if len(live) != 1 || live[0].IP != "10.0.0.5" {
+	if len(live) != 1 || live[0].Host != "10.0.0.5" {
 		t.Errorf("live = %+v, want only the replacement", live)
 	}
 }
@@ -365,14 +365,14 @@ func TestEnsureReplacesTunnelWithStaleEndpoint(t *testing.T) {
 func TestEnsureRecordsPortAndReplacesRemappedTunnel(t *testing.T) {
 	w := newWorld(t)
 	w.alive[42] = true
-	old := Endpoint{Instance: "rig-pod", ID: "id-7", IP: "1.2.3.4", Port: 10341}
+	old := Endpoint{Instance: "rig-pod", ID: "id-7", Host: "1.2.3.4", Port: 10341}
 	w.seed(State{Endpoint: old, Forwards: fwd([2]int{8000, 8000}), PID: 42, Phase: PhaseConnected})
 	live, err := w.manager().List()
 	if err != nil || len(live) != 1 || live[0].Port != 10341 {
 		t.Fatalf("List = %+v, %v; want the seeded tunnel with port 10341", live, err)
 	}
 
-	remapped := Endpoint{Instance: "rig-pod", ID: "id-7", IP: "1.2.3.4", Port: 20517}
+	remapped := Endpoint{Instance: "rig-pod", ID: "id-7", Host: "1.2.3.4", Port: 20517}
 	w.onLaunch = w.connectedSupervisor(43)
 	st, already, err := w.manager().Ensure(remapped, fwd([2]int{8000, 8000}))
 	if err != nil {
@@ -418,7 +418,7 @@ func TestStateOmitsDefaultPort(t *testing.T) {
 func TestEnsureRecordsUser(t *testing.T) {
 	w := newWorld(t)
 	w.onLaunch = w.connectedSupervisor(42)
-	dlami := Endpoint{Instance: "rig-aws", ID: "i-1", IP: "3.4.5.6", User: "ubuntu"}
+	dlami := Endpoint{Instance: "rig-aws", ID: "i-1", Host: "3.4.5.6", User: "ubuntu"}
 	st, _, err := w.manager().Ensure(dlami, fwd([2]int{8000, 8000}))
 	if err != nil {
 		t.Fatal(err)
@@ -438,5 +438,37 @@ func TestEnsureRecordsUser(t *testing.T) {
 	}
 	if strings.Contains(string(b), `"user"`) {
 		t.Errorf("root-user state must not carry a user key: %s", b)
+	}
+}
+
+// The Go field is Host (the glossary reserves "IP" for display), but the
+// on-disk key stays "ip" so state files written before the rename still
+// load — and are still written that way, so a rollback reads them too.
+func TestStateFileKeepsTheIPKey(t *testing.T) {
+	w := newWorld(t)
+	old := `{"instance":"rig-pod","id":"id-7","ip":"1.2.3.4","port":10341,"user":"root",` +
+		`"forwards":[{"local":8000,"remote":8000}],"pid":42,"phase":"connected"}`
+	if err := os.WriteFile(filepath.Join(w.dir, "rig-pod-8000.json"), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w.alive[42] = true
+
+	live, err := w.manager().List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 1 || live[0].Host != "1.2.3.4" || live[0].Port != 10341 {
+		t.Fatalf("live = %+v, want the pre-rename file's host and port", live)
+	}
+
+	if err := writeState(w.dir, live[0]); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(w.dir, "rig-pod-8000.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"ip":"1.2.3.4"`) {
+		t.Errorf("state file changed its key:\n%s", b)
 	}
 }

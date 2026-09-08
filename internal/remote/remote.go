@@ -148,11 +148,11 @@ func Init(t sshx.Target, f Footprint) error {
 	}
 	ensureTools(t, f)
 	if out, err := t.RunWithStdin(RenderTTLScript(f.SelfStop), "cat > ~/.rig/ttl.sh && chmod +x ~/.rig/ttl.sh"); err != nil {
-		return fmt.Errorf("installing ttl.sh: %v: %s", err, out)
+		return fmt.Errorf("installing ttl.sh: %w: %s", err, out)
 	}
 	out, err := t.Run("[ -d /run/systemd/system ] && echo systemd || echo none")
 	if err != nil {
-		return fmt.Errorf("detecting init system: %v: %s", err, out)
+		return fmt.Errorf("detecting init system: %w: %s", err, out)
 	}
 	// last line: an image's login banner may precede the answer
 	if lines := strings.Fields(out); len(lines) > 0 && lines[len(lines)-1] == "systemd" {
@@ -174,7 +174,7 @@ func installUnit(t sshx.Target) error {
 		cmd = fmt.Sprintf("sudo bash -c '%s'", install)
 	}
 	if out, err := t.RunWithStdin(unit, cmd); err != nil {
-		return fmt.Errorf("installing rig-ttl unit: %v: %s", err, out)
+		return fmt.Errorf("installing rig-ttl unit: %w: %s", err, out)
 	}
 	return nil
 }
@@ -183,10 +183,10 @@ func installUnit(t sshx.Target) error {
 // watchdog if its pid is still ours, start a fresh one under nohup/setsid.
 func startDetached(t sshx.Target) error {
 	if out, err := t.RunWithStdin(RenderOnstart(), "cat > ~/.rig/onstart.sh && chmod +x ~/.rig/onstart.sh"); err != nil {
-		return fmt.Errorf("installing onstart.sh: %v: %s", err, out)
+		return fmt.Errorf("installing onstart.sh: %w: %s", err, out)
 	}
 	if out, err := t.Run(ttlRestartCmd); err != nil {
-		return fmt.Errorf("starting ttl.sh: %v: %s", err, out)
+		return fmt.Errorf("starting ttl.sh: %w: %s", err, out)
 	}
 	return nil
 }

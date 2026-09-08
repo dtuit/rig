@@ -39,10 +39,14 @@ type fakeEC2 struct {
 	groups    []types.SecurityGroup
 	instances []types.Instance
 	volumes   []types.Volume
+	images    []types.Image
 
-	zonesErr error
-	runErr   error
-	runOut   *types.Instance // what RunInstances returns on success
+	zonesErr  error
+	runErr    error
+	imagesErr error
+	runOut    *types.Instance // what RunInstances returns on success
+
+	imageCalls int // DescribeImages calls, to prove the root device is cached
 
 	runIn        *ec2.RunInstancesInput
 	imported     *ec2.ImportKeyPairInput
@@ -66,6 +70,20 @@ func (f *fakeEC2) DescribeAvailabilityZones(context.Context, *ec2.DescribeAvaila
 
 func (f *fakeEC2) DescribeInstanceTypes(context.Context, *ec2.DescribeInstanceTypesInput, ...func(*ec2.Options)) (*ec2.DescribeInstanceTypesOutput, error) {
 	return &ec2.DescribeInstanceTypesOutput{InstanceTypes: f.typeInfos}, nil
+}
+
+func (f *fakeEC2) DescribeImages(_ context.Context, in *ec2.DescribeImagesInput, _ ...func(*ec2.Options)) (*ec2.DescribeImagesOutput, error) {
+	f.imageCalls++
+	if f.imagesErr != nil {
+		return nil, f.imagesErr
+	}
+	var out []types.Image
+	for _, img := range f.images {
+		if len(in.ImageIds) == 0 || img.ImageId != nil && in.ImageIds[0] == *img.ImageId {
+			out = append(out, img)
+		}
+	}
+	return &ec2.DescribeImagesOutput{Images: out}, nil
 }
 
 func (f *fakeEC2) DescribeInstanceTypeOfferings(context.Context, *ec2.DescribeInstanceTypeOfferingsInput, ...func(*ec2.Options)) (*ec2.DescribeInstanceTypeOfferingsOutput, error) {
@@ -547,7 +565,9 @@ func TestEnsureSSHKeyImportsOnlyWhenMissing(t *testing.T) {
 
 func TestCreateInstanceRequestShapeAndNetworkOnFirstUse(t *testing.T) {
 	vpcs, subnets := defaultNetwork()
-	e := &fakeEC2{vpcs: vpcs, subnets: subnets}
+	e := &fakeEC2{vpcs: vpcs, subnets: subnets, images: []types.Image{
+		{ImageId: sdk.String("ami-0abc"), RootDeviceName: sdk.String("/dev/sda1")},
+	}}
 	d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
 
 	in, err := d.CreateInstance(t.Context(), provider.CreateInstanceRequest{
@@ -827,5 +847,192 @@ func TestAttachVolumePicksTheNextFreeDevice(t *testing.T) {
 	}
 	if len(e.attached) != 1 || *e.attached[0].Device != "/dev/sdg" {
 		t.Errorf("AttachVolume = %+v, want /dev/sdg (sdf is taken)", e.attached)
+	}
+}
+
+// captureLog points the driver's warning logger at a slice of formatted lines.
+func captureLog(d *Driver) *[]string {
+	var lines []string
+	d.Log = func(format string, a ...any) { lines = append(lines, fmt.Sprintf(format, a...)) }
+	return &lines
+}
+
+func TestCreateInstanceMapsTheAMIsOwnRootDevice(t *testing.T) {
+	vpcs, subnets := defaultNetwork()
+	for _, root := range []string{"/dev/xvda", "/dev/sda1"} {
+		e := &fakeEC2{vpcs: vpcs, subnets: subnets, images: []types.Image{
+			{ImageId: sdk.String("ami-0abc"), RootDeviceName: sdk.String(root)},
+		}}
+		d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+		req := provider.CreateInstanceRequest{
+			Type: "g5.xlarge", Image: "ami-0abc", Name: "rig-train", Location: "ap-southeast-2a",
+			SSHKeyIDs: []string{"k"}, OSVolumeGB: 200,
+		}
+		if _, err := d.CreateInstance(t.Context(), req); err != nil {
+			t.Fatal(err)
+		}
+		m := e.runIn.BlockDeviceMappings
+		if len(m) != 1 || *m[0].DeviceName != root {
+			t.Errorf("AMI rooted at %s: BlockDeviceMappings = %+v, want the size override on %s", root, m, root)
+		}
+		// a second launch from the same AMI reuses the cached answer
+		if _, err := d.CreateInstance(t.Context(), req); err != nil {
+			t.Fatal(err)
+		}
+		if e.imageCalls != 1 {
+			t.Errorf("DescribeImages called %d times, want 1 (cached per AMI)", e.imageCalls)
+		}
+	}
+}
+
+func TestCreateInstanceRootDeviceFallbackWarns(t *testing.T) {
+	vpcs, subnets := defaultNetwork()
+	e := &fakeEC2{vpcs: vpcs, subnets: subnets, imagesErr: &smithy.GenericAPIError{Code: "UnauthorizedOperation", Message: "no ec2:DescribeImages"}}
+	d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+	lines := captureLog(d)
+	if _, err := d.CreateInstance(t.Context(), provider.CreateInstanceRequest{
+		Type: "g5.xlarge", Image: "ami-0abc", Name: "rig-train", Location: "ap-southeast-2a",
+		SSHKeyIDs: []string{"k"}, OSVolumeGB: 200,
+	}); err != nil {
+		t.Fatalf("a root-device lookup failure must not fail the launch: %v", err)
+	}
+	m := e.runIn.BlockDeviceMappings
+	if len(m) != 1 || *m[0].DeviceName != "/dev/sda1" {
+		t.Errorf("BlockDeviceMappings = %+v, want the /dev/sda1 fallback", m)
+	}
+	if len(*lines) != 1 || !strings.Contains((*lines)[0], "ami-0abc") || !strings.Contains((*lines)[0], "/dev/sda1") ||
+		!strings.Contains((*lines)[0], "second") {
+		t.Errorf("warning = %v, want one line naming the AMI, the assumed device and the second-volume risk", *lines)
+	}
+}
+
+func TestPricingOutageWarnsOnce(t *testing.T) {
+	e := &fakeEC2{typeInfos: []types.InstanceTypeInfo{
+		{InstanceType: types.InstanceTypeG5Xlarge},
+		{InstanceType: types.InstanceTypeG52xlarge},
+	}}
+	p := &fakePricing{err: &smithy.GenericAPIError{Code: "AccessDeniedException", Message: "no pricing:GetProducts"}}
+	d := newTestDriver(t, e, &fakeSSM{}, p)
+	lines := captureLog(d)
+	for i := 0; i < 2; i++ {
+		got, err := d.InstanceTypes(t.Context())
+		if err != nil || len(got) != 2 {
+			t.Fatalf("call %d: %+v, %v; want the listing to survive a pricing outage", i, got, err)
+		}
+	}
+	if len(*lines) != 1 {
+		t.Fatalf("warnings = %v, want exactly one (not one per type or per call)", *lines)
+	}
+	w := (*lines)[0]
+	if !strings.Contains(w, "0") || !strings.Contains(w, "spend") {
+		t.Errorf("warning = %q, want it to say prices read 0 and ledger spend will be wrong", w)
+	}
+}
+
+func TestCreateInstanceUnsupportedIsCapacityOnlyInAZone(t *testing.T) {
+	vpcs, subnets := defaultNetwork()
+	// not offered in this zone: the candidate walk should try the next zone
+	e := &fakeEC2{vpcs: vpcs, subnets: subnets, runErr: &smithy.GenericAPIError{
+		Code:    "Unsupported",
+		Message: "Your requested instance type (g5.xlarge) is not supported in your requested Availability Zone (ap-southeast-2a). Please retry your request by not specifying an Availability Zone or choosing ap-southeast-2b, ap-southeast-2c.",
+	}}
+	d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+	_, err := d.CreateInstance(t.Context(), provider.CreateInstanceRequest{Type: "g5.xlarge", Image: "ami-0abc", Name: "rig-train", Location: "ap-southeast-2a", SSHKeyIDs: []string{"k"}})
+	if !errors.Is(err, provider.ErrNoCapacity) {
+		t.Errorf("not-supported-in-AZ: err = %v, want ErrNoCapacity", err)
+	}
+
+	// a genuine misconfiguration must surface, not be swallowed as capacity
+	e2 := &fakeEC2{vpcs: vpcs, subnets: subnets, runErr: &smithy.GenericAPIError{
+		Code:    "Unsupported",
+		Message: "The requested configuration is currently not supported. Please check the documentation for supported configurations.",
+	}}
+	d2 := newTestDriver(t, e2, &fakeSSM{}, &fakePricing{})
+	_, err = d2.CreateInstance(t.Context(), provider.CreateInstanceRequest{Type: "g5.xlarge", Image: "ami-0abc", Name: "rig-train", Location: "ap-southeast-2a", SSHKeyIDs: []string{"k"}})
+	if err == nil || errors.Is(err, provider.ErrNoCapacity) {
+		t.Errorf("unsupported configuration: err = %v, want a plain error, not ErrNoCapacity", err)
+	}
+	if !strings.Contains(err.Error(), "The requested configuration is currently not supported") {
+		t.Errorf("err = %v, want the provider's own message", err)
+	}
+}
+
+func TestSpotRequestQuotaIsNotTheVcpuQuota(t *testing.T) {
+	vpcs, subnets := defaultNetwork()
+	cases := []struct{ typ, want string }{
+		{"g5.xlarge", "L-3819A6DF"},
+		{"p5.48xlarge", "L-7212CCBC"},
+	}
+	for _, c := range cases {
+		e := &fakeEC2{vpcs: vpcs, subnets: subnets, runErr: &smithy.GenericAPIError{
+			Code: "MaxSpotInstanceCountExceeded", Message: "Max spot instance count exceeded",
+		}}
+		d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+		_, err := d.CreateInstance(t.Context(), provider.CreateInstanceRequest{Type: c.typ, Image: "ami-0abc", Name: "rig-train", Location: "ap-southeast-2a", Spot: true, SSHKeyIDs: []string{"k"}})
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: err = %v, want it to name the spot-request quota %s", c.typ, err, c.want)
+		}
+		if strings.Contains(err.Error(), "vCPU") || strings.Contains(err.Error(), "L-DB2E81BA") || strings.Contains(err.Error(), "L-417A185B") {
+			t.Errorf("%s: err = %v; a spot-request-count quota is not the vCPU quota", c.typ, err)
+		}
+		if !strings.Contains(err.Error(), "spot") {
+			t.Errorf("%s: err = %v, want it to say which limit was hit", c.typ, err)
+		}
+	}
+}
+
+// testPubKey and its EC2/ssh-keygen SHA-256 fingerprint, from
+// `ssh-keygen -t ed25519` + `ssh-keygen -lf`.
+const (
+	testPubKey      = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH/4I8awV0iTMDfNzGYj5w0ZW4uWI5uTDvudgtPqN8Qq rig test"
+	testFingerprint = "GzCr+xoz8EPWNIxFxD3MzIlArAEjxMm0xU8xTVZMTzg"
+)
+
+func TestEnsureSSHKeyChecksTheFingerprint(t *testing.T) {
+	// same key already registered: reuse it, do not import again
+	for _, fp := range []string{testFingerprint, testFingerprint + "=", "SHA256:" + testFingerprint} {
+		e := &fakeEC2{keys: []types.KeyPairInfo{{
+			KeyName: sdk.String("rig-key"), KeyPairId: sdk.String("key-0have"),
+			KeyType: types.KeyTypeEd25519, KeyFingerprint: sdk.String(fp),
+		}}}
+		d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+		lines := captureLog(d)
+		id, err := d.EnsureSSHKey(t.Context(), "rig-key", testPubKey)
+		if err != nil || id != "rig-key" || e.imported != nil || len(*lines) != 0 {
+			t.Errorf("fingerprint %q: id %q err %v imported %v warnings %v; want silent reuse", fp, id, err, e.imported != nil, *lines)
+		}
+	}
+
+	// a rotated local key: the stale pair must be named, nothing launched
+	e := &fakeEC2{keys: []types.KeyPairInfo{{
+		KeyName: sdk.String("rig-key"), KeyPairId: sdk.String("key-0stale"),
+		KeyType: types.KeyTypeEd25519, KeyFingerprint: sdk.String("W+jP4nJDp0Cs0Rr0DkYtIeu6qLXBqE0DKyd0kUvKk3s"),
+	}}}
+	d := newTestDriver(t, e, &fakeSSM{}, &fakePricing{})
+	_, err := d.EnsureSSHKey(t.Context(), "rig-key", testPubKey)
+	if err == nil {
+		t.Fatal("a stale key pair with the same name must be an error, not a launch nobody can ssh into")
+	}
+	if !strings.Contains(err.Error(), "rig-key") || !strings.Contains(err.Error(), "delete-key-pair") || !strings.Contains(err.Error(), "ssh.public_key") {
+		t.Errorf("err = %v, want it to name the stale key pair and both ways out", err)
+	}
+	if e.imported != nil {
+		t.Error("a mismatch must not import over the existing pair")
+	}
+
+	// an MD5 fingerprint (an RSA pair, or one EC2 created) is not one rig can
+	// compute: warn and reuse rather than block
+	e2 := &fakeEC2{keys: []types.KeyPairInfo{{
+		KeyName: sdk.String("rig-key"), KeyPairId: sdk.String("key-0rsa"),
+		KeyType: types.KeyTypeRsa, KeyFingerprint: sdk.String("b7:17:02:a4:74:05:a7:d8:46:9c:a1:88:35:f1:55:76"),
+	}}}
+	d2 := newTestDriver(t, e2, &fakeSSM{}, &fakePricing{})
+	lines := captureLog(d2)
+	id, err := d2.EnsureSSHKey(t.Context(), "rig-key", testPubKey)
+	if err != nil || id != "rig-key" || e2.imported != nil {
+		t.Errorf("uncomputable fingerprint: id %q err %v imported %v; want reuse", id, err, e2.imported != nil)
+	}
+	if len(*lines) != 1 || !strings.Contains((*lines)[0], "rig-key") {
+		t.Errorf("warnings = %v, want one line naming the key pair rig could not verify", *lines)
 	}
 }

@@ -137,9 +137,11 @@ func (m dashModel) doAction(action string) tea.Cmd {
 
 func (m dashModel) View() string {
 	var b strings.Builder
+	// spec.md: the dashboard shows `provider · balance`, and no balance at
+	// all for a cloud that cannot report one.
 	head := titleStyle.Render("rig · " + m.app.Provider())
 	if m.data.balance != "" {
-		head += dimStyle.Render("  balance " + m.data.balance)
+		head += titleStyle.Render(" · ") + dimStyle.Render(m.data.balance)
 	}
 	if m.loading {
 		head += dimStyle.Render("  refreshing...")
@@ -153,7 +155,7 @@ func (m dashModel) View() string {
 	// The columns fit the widest reading of each: a container's host:port
 	// endpoint, and an AWS availability zone in LOC.
 	b.WriteString(headerStyle.Render(fmt.Sprintf("  %-14s %-12s %-16s %-21s %-15s %-9s %s",
-		"NAME", "STATUS", "TYPE", "IP", "LOC", "$/H", "AGE")) + "\n")
+		"NAME", "STATUS", "TYPE", "ENDPOINT", "LOC", "$/H", "AGE")) + "\n")
 	if len(m.data.instances) == 0 {
 		b.WriteString(dimStyle.Render("  no rig instances — rig up to create one") + "\n")
 	}
@@ -179,7 +181,7 @@ func (m dashModel) View() string {
 		}
 		b.WriteString(fmt.Sprintf("%s%-14s %s %-16s %-21s %-15s %-9s %s\n",
 			cursor, strings.TrimPrefix(in.Name, core.HostPrefix), status, in.Type,
-			endpointText(in), in.Location, price, ageShort(in.CreatedAt)))
+			in.Endpoint(), in.Location, price, ageShort(in.CreatedAt)))
 	}
 	if burn > 0 {
 		b.WriteString(dimStyle.Render(fmt.Sprintf("\n  burn rate $%.2f/h ($%.0f/day)", burn, burn*24)) + "\n")
@@ -208,20 +210,6 @@ func (m dashModel) View() string {
 		b.WriteString(helpStyle.Render("\n  ↑/↓ select · d delete · r refresh · q quit"))
 	}
 	return b.String()
-}
-
-// endpointText renders the instance's ssh endpoint for the IP column: the
-// host alone on the default port, as every VM is, and host:port for a
-// container's mapped sshd — the same reading as `rig status`.
-func endpointText(in provider.Instance) string {
-	host := in.SSH.Host
-	if host == "" {
-		host = in.IP
-	}
-	if p := in.SSH.Port; p != 0 && p != 22 {
-		return fmt.Sprintf("%s:%d", host, p)
-	}
-	return host
 }
 
 func ageShort(t time.Time) string {

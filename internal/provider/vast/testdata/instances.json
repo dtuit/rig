@@ -1,5 +1,5 @@
 {
- "instances_found": 7,
+ "instances_found": 8,
  "instances": [
   {
    "id": 20001,
@@ -252,6 +252,39 @@
      }
     ]
    },
+   "direct_port_start": 41000,
+   "direct_port_end": 41199,
+   "start_date": 1757300000.123,
+   "end_date": null,
+   "disk_space": 20.0,
+   "onstart": "touch ~/.no_auto_tmux; [ -f ~/.rig/onstart.sh ] && bash ~/.rig/onstart.sh"
+  },
+  {
+   "id": 20008,
+   "machine_id": 27008,
+   "label": "rig-odd",
+   "actual_status": "recreating",
+   "intended_status": "running",
+   "cur_state": "running",
+   "next_state": "running",
+   "status_msg": "",
+   "image_uuid": "vastai/pytorch:cuda-12.8.1-auto",
+   "image_runtype": "ssh_direc ssh_proxy",
+   "gpu_name": "RTX 4090",
+   "num_gpus": 1,
+   "gpu_ram": 24564,
+   "cpu_ram": 48264,
+   "cpu_cores_effective": 24.0,
+   "dph_total": 0.2962962962962963,
+   "dph_base": 0.29333333333333333,
+   "storage_cost": 0.2,
+   "min_bid": 0.29333333333333333,
+   "is_bid": false,
+   "geolocation": "United States, US",
+   "public_ipaddr": "185.62.108.4",
+   "ssh_host": "ssh5.vast.ai",
+   "ssh_port": 15834,
+   "ports": null,
    "direct_port_start": 41000,
    "direct_port_end": 41199,
    "start_date": 1757300000.123,

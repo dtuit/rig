@@ -150,7 +150,8 @@ func (d *Driver) Locations(ctx context.Context) ([]provider.Location, error) {
 
 // InstanceTypes reads the marketplace as a catalogue: one row per GPU shape
 // with the cheapest on-demand price, the cheapest bid as SpotPrice, and the
-// offer count in Description, cheapest first.
+// offer count in Description, cheapest first. A shape only the bid market
+// carries is priced by its cheapest bid and says "(bid only)".
 func (d *Driver) InstanceTypes(ctx context.Context) ([]provider.InstanceType, error) {
 	cat, err := d.catalogue(ctx)
 	if err != nil {
@@ -196,7 +197,7 @@ func (d *Driver) Images(context.Context, string) ([]provider.Image, error) {
 
 // unsupportedVolumes is every volume method's answer.
 func unsupportedVolumes() error {
-	return fmt.Errorf("Vast volumes are machine-bound; use rig fetch/rig sync or cloud sync — see spec follow-up: %w", provider.ErrUnsupported)
+	return fmt.Errorf("Vast volumes are machine-bound, so rig cannot attach one: copy data with rig sync/rig fetch, or use Vast's cloud sync: %w", provider.ErrUnsupported)
 }
 
 func (d *Driver) ListVolumes(context.Context) ([]provider.Volume, error) {

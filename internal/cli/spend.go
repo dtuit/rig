@@ -3,7 +3,9 @@ package cli
 import (
 	"fmt"
 	"os"
+	"slices"
 	"sort"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -38,20 +40,23 @@ marked with ~.`,
 				fmt.Println("no spend recorded")
 				return nil
 			}
-			// one cloud in the window: today's table; several: each row
-			// names its cloud and each cloud gets a subtotal, so a RunPod
-			// pod's cost is never read as Verda's
+			// one cloud in play: today's table; several: each row names
+			// its cloud and each cloud gets a subtotal, so a RunPod pod's
+			// cost is never read as Verda's. Same rule as `rig status`
+			// (severalProviders), so the two tables never disagree.
 			subtotals := map[string]float64{}
+			provs := make([]string, 0, len(lines))
 			for _, l := range lines {
 				subtotals[l.Provider] += l.Cost
+				provs = append(provs, l.Provider)
 			}
-			several := len(subtotals) > 1
+			several := severalProviders(configForDisplay(), provs)
 			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+			head := []string{"NAME", "TYPE", "STARTED", "HOURS", "COST"}
 			if several {
-				fmt.Fprintln(w, "NAME\tPROVIDER\tTYPE\tSTARTED\tHOURS\tCOST")
-			} else {
-				fmt.Fprintln(w, "NAME\tTYPE\tSTARTED\tHOURS\tCOST")
+				head = slices.Insert(head, 1, "PROVIDER")
 			}
+			fmt.Fprintln(w, strings.Join(head, "\t"))
 			estimated := false
 			for _, l := range lines {
 				marker := ""
@@ -59,12 +64,14 @@ marked with ~.`,
 					marker = "~"
 					estimated = true
 				}
-				prov := ""
-				if several {
-					prov = l.Provider + "\t"
+				cells := []string{
+					l.Name, l.Type, l.StartedAt.Local().Format("Jan 02 15:04"),
+					fmt.Sprintf("%.1f", l.Hours), fmt.Sprintf("%s$%.2f", marker, l.Cost),
 				}
-				fmt.Fprintf(w, "%s\t%s%s\t%s\t%.1f\t%s$%.2f\n",
-					l.Name, prov, l.Type, l.StartedAt.Local().Format("Jan 02 15:04"), l.Hours, marker, l.Cost)
+				if several {
+					cells = slices.Insert(cells, 1, l.Provider)
+				}
+				fmt.Fprintln(w, strings.Join(cells, "\t"))
 			}
 			w.Flush()
 			// issue 17: explain the ~ marker only when a row carries it.

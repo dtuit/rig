@@ -1,0 +1,48 @@
+{
+ "offers": [
+  {
+   "id": 26184983,
+   "machine_id": 41922,
+   "gpu_name": "RTX 5080",
+   "num_gpus": 2,
+   "gpu_ram": 16303,
+   "cpu_ram": 128582,
+   "cpu_cores_effective": 20.0,
+   "dph_total": 0.2817777777777778,
+   "dph_base": 0.28,
+   "min_bid": 0.28,
+   "geolocation": "North Carolina, US",
+   "reliability2": 0.9987071,
+   "rentable": true,
+   "rented": false,
+   "verified": null,
+   "external": null,
+   "direct_port_count": 198,
+   "cuda_max_good": 13.0,
+   "disk_space": 1070.0,
+   "is_bid": false
+  },
+  {
+   "id": 49614257,
+   "machine_id": 144814,
+   "gpu_name": "RTX 5080",
+   "num_gpus": 2,
+   "gpu_ram": 16303,
+   "cpu_ram": 225480,
+   "cpu_cores_effective": 32.0,
+   "dph_total": 0.30348148148148146,
+   "dph_base": 0.302,
+   "min_bid": 0.302,
+   "geolocation": "Latvia, LV",
+   "reliability2": 0.9963659,
+   "rentable": true,
+   "rented": false,
+   "verified": null,
+   "external": null,
+   "direct_port_count": 256,
+   "cuda_max_good": 13.2,
+   "disk_space": 16.0,
+   "is_bid": false
+  }
+ ]
+}
