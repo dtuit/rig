@@ -43,6 +43,10 @@ providers:                               # per-provider blocks; env vars always 
     ssh_cidrs: []                          # who may ssh in; empty = your current public IP, /32
     vpc: vpc-0123456789abcdef0             # needed when the account has no default VPC
     subnets: [subnet-0aaa, subnet-0bbb]    # one per zone rig may use; imply their VPC
+  ssh:                                     # machines rig is lent, not rents (see below)
+    user: me@corp.example                  # default login user; a host may set its own
+    hosts:
+      gpu13: { host: gpu13.corp.example, gpu: 1x RTX 4090 }   # also port, user
 ssh:
   user: root                             # optional override of the provider's login user
   public_key: ~/.ssh/id_ed25519.pub      # registered with the provider on first up
@@ -131,6 +135,31 @@ so a restart from the RunPod console or API — or a start after the watchdog
 stopped the pod — deletes `~/.rig` with the deadline, `ttl.sh` and the re-arm
 hook in it. The pod then runs with **no watchdog** and `rig status` shows its
 TTL as `-`. Run `rig adopt <name>` after any such restart.
+
+### Static ssh hosts
+
+The `ssh` provider drives machines you already have — a shared office GPU box,
+a workstation — listed by hand under `providers.ssh.hosts`. Each appears as
+instance `<key>` (hostname `rig-<key>`), `running` when its sshd port answers
+and `error`/`unreachable` when it does not. Everything that only needs ssh
+works as on a cloud instance: `ssh`, `run`, `logs`, `ps`, `wait`, `sync`,
+`fetch`, `tunnel`. What would treat the machine as rig's to rent is refused:
+`up`, `down` and `extend` fail with `unsupported by provider`, the dashboard's
+create picker leaves the provider out, and nothing is written to the spend
+ledger.
+
+`rig adopt <key>` creates `~/.rig` and **installs no TTL watchdog**: a shared
+machine is not rig's to shut down, and rig would need root to install the unit
+anyway. A host's own `user` wins over the top-level `ssh.user`.
+
+Login is key-only, as everywhere in rig: ssh runs without a terminal, and the
+supervised tunnels reconnect unattended, so a password prompt has nowhere to
+go. Install the key once with your password —
+`ssh-copy-id -i ~/.ssh/<key>.pub -o User=<user> <host>` — and check it with
+`ssh -o BatchMode=yes -i ~/.ssh/<key> -l <user> <host> true`. A user with an
+`@` in it (an AD login such as `me@corp.example`) works as is. `rig run` needs
+`tmux` and `rig sync`/`fetch` need `rsync` on the host; without passwordless
+sudo rig cannot install them, and `adopt` warns which are missing.
 
 ## Use
 

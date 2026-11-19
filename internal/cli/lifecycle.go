@@ -140,6 +140,9 @@ func newDownCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if a.Static() {
+				return core.ErrStatic(a.Provider(), "deleted")
+			}
 			var targets []provider.Instance
 			if all {
 				instances, err := a.Managed(cmd.Context())
@@ -252,6 +255,9 @@ func newExtendCmd() *cobra.Command {
 			a, err := newApp()
 			if err != nil {
 				return err
+			}
+			if a.Static() {
+				return fmt.Errorf("%s hosts have no self-destruct deadline to extend: %w", a.Provider(), provider.ErrUnsupported)
 			}
 			key, d, err := parseExtendArgs(args, by, cmd.Flags().Changed("by"))
 			if err != nil {
@@ -370,6 +376,9 @@ func spotTag(spot bool) string {
 }
 
 func age(t time.Time) string {
+	if t.IsZero() { // a static ssh host was never created by anyone rig knows
+		return "-"
+	}
 	d := time.Since(t)
 	switch {
 	case d > 48*time.Hour:

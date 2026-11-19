@@ -22,6 +22,7 @@ import (
 	// drivers register themselves with the provider registry on import
 	_ "github.com/dtuit/rig/internal/provider/aws"
 	_ "github.com/dtuit/rig/internal/provider/runpod"
+	_ "github.com/dtuit/rig/internal/provider/sshhost"
 	_ "github.com/dtuit/rig/internal/provider/vast"
 	_ "github.com/dtuit/rig/internal/provider/verda"
 )
@@ -191,7 +192,15 @@ func pause() {
 // several), then that cloud's picker, then the launch itself. A cancelled
 // picker is neither an instance nor an error.
 func createFromDashboard(ctx context.Context, fleet *core.Fleet) (*provider.Instance, error) {
-	name, err := tui.PickProvider(fleet.Names(), fleet.Cfg.Provider)
+	// a static provider's hosts are configured, not launched
+	var names []string
+	for _, n := range fleet.Names() {
+		if a, err := fleet.App(n); err == nil && a.Static() {
+			continue
+		}
+		names = append(names, n)
+	}
+	name, err := tui.PickProvider(names, fleet.Cfg.Provider)
 	if err != nil || name == "" {
 		return nil, err
 	}

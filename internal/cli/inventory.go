@@ -266,6 +266,10 @@ providers:                             # per-provider blocks; env vars always wi
     default_image: ""                      # SSM parameter path (/aws/...) or ami-xxxx
     volume_type: gp3                       # EBS type for data volumes
     families: [g6, g6e, p5]                # instance families rig types lists
+  ssh:                                     # machines rig is lent: never created, deleted or TTL-stopped
+    user: me@corp.example                  # login user for hosts that name none
+    hosts:
+      gpu13: { host: gpu13.corp.example, port: 22, gpu: 1x RTX 4090 }  # rig -i gpu13 ...
 tui:
   theme: auto                          # auto | light — the dashboard's selection band;
                                        # light is a pale band with dark text, for a

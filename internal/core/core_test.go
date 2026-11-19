@@ -646,3 +646,29 @@ func TestResolveMatchesOnlyTheActiveProvidersCache(t *testing.T) {
 		t.Errorf("runpod Resolve(train) = %+v, %v; want runpod's %s", got, err, pod.ID)
 	}
 }
+
+// A static host's per-host user wins over ssh.user, which is about the
+// clouds' images; provisioning and deleting one are refused before the
+// driver is asked.
+func TestStaticProviderUserAndLifecycle(t *testing.T) {
+	prov := fake.New()
+	prov.Caps = provider.Capabilities{Static: true}
+	app, _ := newApp(t, prov)
+	app.Cfg.SSH.User = "ops"
+	in := &provider.Instance{Name: "rig-gpu13", IP: "h", SSH: provider.Endpoint{Host: "h", Port: 22, User: "me@corp"}}
+	if got := app.Target(in); got.User != "me@corp" {
+		t.Errorf("static target user = %q, want the host's me@corp over ssh.user", got.User)
+	}
+	if _, err := app.Provision(t.Context(), UpSpec{Name: "x", Types: []string{"t"}}); !errors.Is(err, provider.ErrUnsupported) {
+		t.Errorf("Provision err = %v, want ErrUnsupported", err)
+	}
+	if _, err := app.Down(t.Context(), in, false); !errors.Is(err, provider.ErrUnsupported) {
+		t.Errorf("Down err = %v, want ErrUnsupported", err)
+	}
+	if len(prov.Deleted) != 0 {
+		t.Errorf("Down reached the driver: %v", prov.Deleted)
+	}
+	if !app.Footprint(time.Hour).NoWatchdog {
+		t.Error("static footprint must not install the watchdog")
+	}
+}

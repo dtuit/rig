@@ -131,7 +131,7 @@ func StartJob(t sshx.Target, name, workdir, command string) error {
 	script += "set -a; for f in \"$HOME\"/.rig/env/*; do [ -f \"$f\" ] && . \"$f\"; done; set +a\n"
 	script += command + "\n"
 	if out, err := t.RunWithStdin(script,
-		fmt.Sprintf("cat > ~/.rig/jobs/%s.sh && chmod +x ~/.rig/jobs/%s.sh", name, name)); err != nil {
+		fmt.Sprintf("mkdir -p ~/.rig/jobs ~/.rig/logs ~/.rig/env && cat > ~/.rig/jobs/%s.sh && chmod +x ~/.rig/jobs/%s.sh", name, name)); err != nil {
 		return fmt.Errorf("writing job script: %w: %s", err, out)
 	}
 	if out, err := t.RunWithStdin(RenderJobWrapper(name, workdir, command),

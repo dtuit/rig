@@ -1,7 +1,7 @@
 # rig
 
-GPU cloud workbench: provisions ephemeral GPU instances on a provider (Verda, RunPod, Vast.ai or
-AWS EC2 — one per command), gets you — or your AI agent — onto them, and runs detached jobs that
+GPU cloud workbench: provisions ephemeral GPU instances on a provider (Verda, RunPod, Vast.ai,
+AWS EC2, or static ssh hosts — one per command), gets you — or your AI agent — onto them, and runs detached jobs that
 survive disconnects.
 
 ## Language
@@ -21,6 +21,12 @@ An ephemeral cloud VM or container created and managed by rig, identified by a `
 prefix (Vast.ai carries the name in the instance label).
 _Avoid_: box, machine, server, node, pod (RunPod's word for it — the driver maps, the docs and
 code say instance)
+
+**Static host**:
+A machine rig is lent rather than rents — listed under `providers.ssh.hosts`, reached by ssh,
+and still an instance to every ssh-based command. rig never creates, deletes or self-stops one,
+and installs no watchdog on it (`Capabilities.Static`).
+_Avoid_: local instance, on-prem instance
 
 **Fleet**:
 Every provider one config drives, opened lazily and surveyed together — what the dashboard shows

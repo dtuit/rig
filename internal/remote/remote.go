@@ -149,6 +149,10 @@ type Footprint struct {
 	// means DefaultSelfStop (a VM). Container drivers supply theirs via
 	// provider.Capabilities.SelfStop.
 	SelfStop string
+	// NoWatchdog installs only the ~/.rig layout: no ttl.sh, no deadline.
+	// For a shared host rig is lent (provider.Capabilities.Static), which is
+	// not rig's to stop and where rig has no root to install a unit.
+	NoWatchdog bool
 	// Log receives warnings Init does not fail on (missing tmux/rsync); nil
 	// discards them.
 	Log func(format string, a ...any)
@@ -172,6 +176,9 @@ func Init(t sshx.Target, f Footprint) error {
 		return fmt.Errorf("creating ~/.rig: %w", err)
 	}
 	ensureTools(t, f)
+	if f.NoWatchdog {
+		return nil
+	}
 	if out, err := t.RunWithStdin(RenderTTLScript(f.SelfStop), "cat > ~/.rig/ttl.sh && chmod +x ~/.rig/ttl.sh"); err != nil {
 		return fmt.Errorf("installing ttl.sh: %w: %s", err, out)
 	}

@@ -50,6 +50,12 @@ func newAdoptCmd() *cobra.Command {
 			if err := remote.Init(t, a.Footprint(d)); err != nil {
 				return err
 			}
+			if a.Static() {
+				// lent, not rented: no watchdog, nothing to bill
+				a.Remember(in)
+				fmt.Printf("%s adopted: ~/.rig ready (static host, no TTL)\n", strings.TrimPrefix(in.Name, core.HostPrefix))
+				return nil
+			}
 			// adopted instances would otherwise be invisible to rig spend
 			start := in.CreatedAt
 			if start.IsZero() {

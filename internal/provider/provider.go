@@ -50,6 +50,11 @@ type Capabilities struct {
 	// its own container using only the instance-scoped token the provider
 	// injects (ADR-0003). Trusted driver text, not user input.
 	SelfStop string
+	// Static means the instances are machines rig is lent, not rents: listed
+	// in config, never created, deleted or self-stopped. Core refuses up,
+	// down and extend for them, installs no TTL watchdog, and lets the
+	// host's configured login user win over config ssh.user.
+	Static bool
 }
 
 // Endpoint is where an instance's sshd answers. VMs report their IP on port

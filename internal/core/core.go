@@ -267,10 +267,15 @@ func (a *App) refreshCached(in *provider.Instance) {
 // Target is the ssh endpoint for in: the host and port the provider reports
 // (falling back to the IP on the default port for a driver that fills none),
 // as the provider's login user unless config ssh.user overrides it — and
-// root when neither says.
+// root when neither says. A static host's user was configured for that host
+// by hand, so it wins over ssh.user, which is about the clouds' images.
 func (a *App) Target(in *provider.Instance) sshx.Target {
+	user := orDefault(a.Cfg.SSH.User, orDefault(in.SSH.User, "root"))
+	if a.Prov.Capabilities().Static && in.SSH.User != "" {
+		user = in.SSH.User
+	}
 	t := sshx.Target{
-		User:         orDefault(a.Cfg.SSH.User, orDefault(in.SSH.User, "root")),
+		User:         user,
 		Host:         orDefault(in.SSH.Host, in.IP),
 		Port:         in.SSH.Port,
 		ForwardAgent: a.Cfg.ForwardAgent(),
@@ -482,6 +487,9 @@ func (a *App) Provision(ctx context.Context, spec UpSpec) (*provider.Instance, e
 // include the OS volume.
 func (a *App) provision(ctx context.Context, spec UpSpec) (*provider.Instance, []string, error) {
 	caps := a.Prov.Capabilities()
+	if caps.Static {
+		return nil, nil, ErrStatic(a.Provider(), "created")
+	}
 	if spec.Spot && !caps.Spot {
 		return nil, nil, fmt.Errorf("%s does not offer spot instances: %w", a.Provider(), provider.ErrUnsupported)
 	}
@@ -621,7 +629,18 @@ func (a *App) discard(ctx context.Context, in *provider.Instance) {
 // driver's self-stop line, warnings routed to the App log. Exported for the
 // caller that installs it itself (rig adopt); Up uses it too.
 func (a *App) Footprint(ttl time.Duration) remote.Footprint {
-	return remote.Footprint{TTL: ttl, SelfStop: a.Prov.Capabilities().SelfStop, Log: a.logf}
+	caps := a.Prov.Capabilities()
+	return remote.Footprint{TTL: ttl, SelfStop: caps.SelfStop, NoWatchdog: caps.Static, Log: a.logf}
+}
+
+// Static reports whether this App's instances are machines rig is lent
+// (provider.Capabilities.Static): no up, down, extend or watchdog.
+func (a *App) Static() bool { return a.Prov.Capabilities().Static }
+
+// ErrStatic is the refusal for a lifecycle verb on a static host.
+func ErrStatic(prov, verb string) error {
+	return fmt.Errorf("%s hosts are configured in providers.%s.hosts, not %s by rig (rig adopt sets one up): %w",
+		prov, prov, verb, provider.ErrUnsupported)
 }
 
 // Up runs the whole launch flow and returns the running, initialized instance.
@@ -776,6 +795,9 @@ func (a *App) History(in *provider.Instance) []ledger.Event {
 
 func (a *App) Down(ctx context.Context, in *provider.Instance, deleteVolumes bool) (ledger.Event, error) {
 	a.stamp(in) // the ledger event must say which cloud billed this
+	if a.Static() {
+		return ledger.Event{}, ErrStatic(a.Provider(), "deleted")
+	}
 	if err := a.Prov.DeleteInstance(ctx, in.ID, volumesToDelete(in, deleteVolumes)); err != nil {
 		if isNotFound(err) {
 			a.Forget(in) // the provider lost it first; the cache must not keep resolving to it

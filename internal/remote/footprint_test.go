@@ -291,3 +291,26 @@ func TestWatchdogRecordsFiring(t *testing.T) {
 		t.Errorf("nothing recorded the stop:\n%s", log)
 	}
 }
+
+// A static host gets the ~/.rig layout and nothing else: no ttl.sh, no
+// unit, no deadline — it is shared and not rig's to stop.
+func TestInitNoWatchdogInstallsLayoutOnly(t *testing.T) {
+	cmdlog := stubSSH(t, "systemd")
+	target := sshx.Target{User: "me@corp", Host: "127.0.0.1", NoMultiplex: true}
+	if err := Init(target, Footprint{TTL: time.Hour, NoWatchdog: true}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(cmdlog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmds := string(b)
+	if !strings.Contains(cmds, "mkdir -p ~/.rig/busy.d ~/.rig/logs ~/.rig/jobs ~/.rig/env") {
+		t.Errorf("Init did not create the layout:\n%s", cmds)
+	}
+	for _, bad := range []string{"ttl.sh", "systemctl", "deadline", "/run/systemd/system"} {
+		if strings.Contains(cmds, bad) {
+			t.Errorf("NoWatchdog Init issued %q:\n%s", bad, cmds)
+		}
+	}
+}
