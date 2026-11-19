@@ -97,3 +97,47 @@ func ts(s string) time.Time {
 	}
 	return t
 }
+
+// `rig spend -i <name>` asks a different question of the same ledger: what
+// happened to this instance and when, rather than what the estate cost.
+func TestSpendForOneInstanceIsATimeline(t *testing.T) {
+	extend := ledger.Event{Event: "extend", Time: ts("2026-08-18T11:30:00Z"), ID: "i1",
+		Name: "rig-train", Type: "1H100", PricePerHour: 1.79, Deadline: ts("2026-08-19T02:00:00Z")}
+	seedLedger(t, verdaUp, extend, verdaDown, podUp, podDown)
+	out := runRig(t, &fakeProvider{}, "spend", "-i", "train")
+
+	if !strings.HasPrefix(out, "WHEN") {
+		t.Errorf("not a timeline:\n%s", out)
+	}
+	for _, want := range []string{"up", "extend", "down", "1H100 in", "ttl 12h", "cost $10.92"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("timeline missing %q:\n%s", want, out)
+		}
+	}
+	// the other cloud's instance is not this instance's history
+	if strings.Contains(out, "rig-pod") || strings.Contains(out, "1xA100-SXM") {
+		t.Errorf("another instance leaked in:\n%s", out)
+	}
+	// and it is a timeline, not a summary
+	if strings.Contains(out, "total: $") {
+		t.Errorf("printed the estate summary as well:\n%s", out)
+	}
+}
+
+// An instance with no down event is still open; the watchdog leaves none, so
+// the timeline has to say so rather than trailing off.
+func TestSpendForOneInstanceSaysWhenItIsStillOpen(t *testing.T) {
+	seedLedger(t, verdaUp)
+	out := runRig(t, &fakeProvider{}, "spend", "-i", "rig-train")
+	if !strings.Contains(out, "still open since") {
+		t.Errorf("an unclosed instance should say so:\n%s", out)
+	}
+}
+
+func TestSpendForAnUnknownInstanceSaysSo(t *testing.T) {
+	seedLedger(t, verdaUp, verdaDown)
+	out := runRig(t, &fakeProvider{}, "spend", "-i", "nonesuch")
+	if !strings.Contains(out, "no ledger events for nonesuch") {
+		t.Errorf("want a plain answer, got:\n%s", out)
+	}
+}

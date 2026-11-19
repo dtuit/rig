@@ -5,7 +5,6 @@ package remote
 import (
 	"fmt"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -30,33 +29,59 @@ const ttlScript = `#!/usr/bin/env bash
 # exiting 0.
 set -u
 DIR="${RIG_DIR:-${HOME:-/root}/.rig}"
-rig_jobs_running() {
+LOG="$DIR/ttl.log"
+# The watchdog writes down every decision it makes, so "why is this instance
+# still up, hours past its TTL" has an answer on the instance itself. It logs
+# to the file rather than to stdout so a container (nohup) and a VM (systemd,
+# whose stdout goes to the journal) leave the same record in the same place,
+# and a reader needs no init-system branch. Capped: this runs for the life of
+# the instance.
+ttl_log() {
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null || return 0
+  if [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 400 ]; then
+    tail -n 200 "$LOG" > "$LOG.trim" 2>/dev/null && mv "$LOG.trim" "$LOG" 2>/dev/null
+  fi
+}
+rig_jobs_names() {
   for s in /tmp/tmux-*/default; do
     [ -S "$s" ] || continue
-    tmux -S "$s" ls -F '#{session_name}' 2>/dev/null | grep -q '^rig-' && return 0
+    tmux -S "$s" ls -F '#{session_name}' 2>/dev/null | sed -n 's/^rig-//p'
   done
-  return 1
 }
+rig_jobs_running() { [ -n "$(rig_jobs_names)" ]; }
+stamp() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "epoch $1"; }
+ttl_log "watchdog started (pid $$)"
+seen=""
 while true; do
-  sleep 60
+  sleep "${RIG_TTL_POLL:-60}"
   [ -f "$DIR/deadline" ] || continue
   d=$(cat "$DIR/deadline" 2>/dev/null) || continue
   now=$(date +%s)
+  if [ "$d" != "$seen" ]; then
+    ttl_log "armed for $(stamp "$d")"
+    seen="$d"
+  fi
   [ "$now" -lt "$d" ] && continue
-  if rig_jobs_running; then
-    echo $((now + 3600)) > "$DIR/deadline"
+  jobs=$(rig_jobs_names | tr '\n' ',' | sed 's/,$//')
+  if [ -n "$jobs" ]; then
+    seen=$((now + 3600))
+    echo "$seen" > "$DIR/deadline"
+    ttl_log "deferred 1h to $(stamp "$seen") (jobs running: $jobs)"
     continue
   fi
-  busy=0
+  busy=""
   if [ -d "$DIR/busy.d" ]; then
     for h in "$DIR"/busy.d/*; do
-      [ -x "$h" ] && "$h" >/dev/null 2>&1 && busy=1 && break
+      [ -x "$h" ] && "$h" >/dev/null 2>&1 && busy=$(basename "$h") && break
     done
   fi
-  if [ "$busy" = 1 ]; then
-    echo $((now + 3600)) > "$DIR/deadline"
+  if [ -n "$busy" ]; then
+    seen=$((now + 3600))
+    echo "$seen" > "$DIR/deadline"
+    ttl_log "deferred 1h to $(stamp "$seen") (busy.d/$busy said busy)"
     continue
   fi
+  ttl_log "deadline reached, stopping the instance"
   logger -t rig-ttl "deadline reached, shutting down" 2>/dev/null || true
   ` + ttlSelfStopPlaceholder + `
 done
@@ -88,7 +113,7 @@ WantedBy=multi-user.target
 // ssh session's end does not take it, its pid in ~/.rig/ttl.pid so Init
 // and onstart.sh can tell a live watchdog from a stale file.
 const (
-	ttlStartLine = "nohup setsid ~/.rig/ttl.sh >~/.rig/ttl.log 2>&1 & echo $! > ~/.rig/ttl.pid"
+	ttlStartLine = "nohup setsid ~/.rig/ttl.sh >>~/.rig/ttl.log 2>&1 & echo $! > ~/.rig/ttl.pid"
 	// ttlAliveCheck sets p to the recorded pid and succeeds only when that
 	// pid is still our ttl.sh (a container restart recycles pids).
 	ttlAliveCheck = `p=$(cat ~/.rig/ttl.pid 2>/dev/null); [ -n "$p" ] && grep -qa ttl.sh "/proc/$p/cmdline" 2>/dev/null`
@@ -243,6 +268,30 @@ func Deadline(t sshx.Target) (time.Time, error) {
 	return time.Unix(n, 0), nil
 }
 
+// WatchdogLog is what the TTL watchdog has written down on the instance:
+// when it armed, every deadline it deferred and why, and the moment it
+// fired. Newest last, as the file has it.
+//
+// An empty answer is not an error. An instance adopted before the watchdog
+// kept a record has no file, and one that has never reached its deadline
+// has only the arming lines — the caller says "nothing yet", not "failed".
+func WatchdogLog(t sshx.Target, lines int) ([]string, error) {
+	if lines <= 0 {
+		lines = 50
+	}
+	out, err := t.Run(fmt.Sprintf("tail -n %d ~/.rig/ttl.log 2>/dev/null || true", lines))
+	if err != nil {
+		return nil, fmt.Errorf("reading the watchdog log: %w: %s", err, out)
+	}
+	var kept []string
+	for _, l := range strings.Split(out, "\n") {
+		if l = strings.TrimRight(l, "\r"); strings.TrimSpace(l) != "" {
+			kept = append(kept, l)
+		}
+	}
+	return kept, nil
+}
+
 // PushEnvFile copies a local env file to ~/.rig/env/<base>; rig jobs source
 // every file there before running.
 func PushEnvFile(t sshx.Target, content, base string) error {
@@ -252,90 +301,6 @@ func PushEnvFile(t sshx.Target, content, base string) error {
 	out, err := t.RunWithStdin(content, fmt.Sprintf("cat > ~/.rig/env/%s && chmod 600 ~/.rig/env/%s", base, base))
 	if err != nil {
 		return fmt.Errorf("pushing env %s: %v: %s", base, err, out)
-	}
-	return nil
-}
-
-type Job struct {
-	Name     string `json:"name"`
-	Running  bool   `json:"running"`
-	ExitCode int    `json:"exit_code"` // valid when !Running
-}
-
-// StartJob runs command detached in tmux session rig-<name>, logging to
-// ~/.rig/logs/<name>.log and recording the exit code on completion.
-func StartJob(t sshx.Target, name, workdir, command string) error {
-	if !nameRe.MatchString(name) {
-		return fmt.Errorf("job name must match %s", nameRe)
-	}
-	script := "#!/bin/bash\n"
-	script += "export PATH=\"$HOME/.local/bin:$PATH\"\n"
-	if workdir != "" {
-		script += fmt.Sprintf("cd %q || exit 1\n", workdir)
-	}
-	script += "set -a; for f in \"$HOME\"/.rig/env/*; do [ -f \"$f\" ] && . \"$f\"; done; set +a\n"
-	script += command + "\n"
-	if out, err := t.RunWithStdin(script,
-		fmt.Sprintf("cat > ~/.rig/jobs/%s.sh && chmod +x ~/.rig/jobs/%s.sh", name, name)); err != nil {
-		return fmt.Errorf("writing job script: %v: %s", err, out)
-	}
-	// fresh log/exit per start
-	start := fmt.Sprintf(
-		`rm -f ~/.rig/logs/%[1]s.exit && : > ~/.rig/logs/%[1]s.log && tmux new-session -d -s rig-%[1]s `+
-			`'"$HOME"/.rig/jobs/%[1]s.sh >> "$HOME"/.rig/logs/%[1]s.log 2>&1; echo $? > "$HOME"/.rig/logs/%[1]s.exit'`,
-		name)
-	if out, err := t.Run(start); err != nil {
-		if strings.Contains(out, "duplicate session") {
-			return fmt.Errorf("job %q is already running", name)
-		}
-		return fmt.Errorf("starting job: %v: %s", err, out)
-	}
-	return nil
-}
-
-func ListJobs(t sshx.Target) ([]Job, error) {
-	out, err := t.Run(`tmux ls -F '#{session_name}' 2>/dev/null | grep '^rig-' | sed 's/^rig-/RUN /'; ` +
-		`for f in "$HOME"/.rig/logs/*.exit; do [ -f "$f" ] || continue; echo "EXIT $(basename "$f" .exit) $(cat "$f")"; done; true`)
-	if err != nil {
-		return nil, fmt.Errorf("listing jobs: %v: %s", err, out)
-	}
-	var jobs []Job
-	seen := map[string]bool{}
-	for _, line := range strings.Split(out, "\n") {
-		f := strings.Fields(line)
-		switch {
-		case len(f) == 2 && f[0] == "RUN":
-			jobs = append(jobs, Job{Name: f[1], Running: true})
-			seen[f[1]] = true
-		case len(f) == 3 && f[0] == "EXIT" && !seen[f[1]]:
-			code, _ := strconv.Atoi(f[2])
-			jobs = append(jobs, Job{Name: f[1], ExitCode: code})
-		}
-	}
-	sort.Slice(jobs, func(i, j int) bool { return jobs[i].Name < jobs[j].Name })
-	return jobs, nil
-}
-
-func TailLog(t sshx.Target, name string, follow bool, lines int) error {
-	if !nameRe.MatchString(name) {
-		return fmt.Errorf("invalid job name %q", name)
-	}
-	cmd := fmt.Sprintf("tail -n %d ~/.rig/logs/%s.log", lines, name)
-	if follow {
-		cmd += " -f"
-	}
-	return t.Stream(cmd)
-}
-
-func StopJob(t sshx.Target, name string) error {
-	if !nameRe.MatchString(name) {
-		return fmt.Errorf("invalid job name %q", name)
-	}
-	// =rig-<name> is tmux's exact-match target; without it rig-<name> would
-	// also match a prefix sibling like rig-<name>2 (issue 11).
-	out, err := t.Run(fmt.Sprintf("tmux kill-session -t =rig-%s", name))
-	if err != nil {
-		return fmt.Errorf("stopping job %s: %v: %s", name, err, out)
 	}
 	return nil
 }

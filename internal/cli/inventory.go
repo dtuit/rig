@@ -84,8 +84,8 @@ func newTypesCmd() *cobra.Command {
 				if hasSpot {
 					spotStr = fmt.Sprintf("%.2f", r.SpotPrice)
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%.2f\t%s\t%s\n",
-					r.Type, r.GPU, r.MemoryText(), r.PricePerHour, spotStr, availStr)
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+					r.Type, r.GPU, r.MemoryText(), r.PriceText(), spotStr, availStr)
 			}
 			if err := w.Flush(); err != nil {
 				return err
@@ -266,6 +266,10 @@ providers:                             # per-provider blocks; env vars always wi
     default_image: ""                      # SSM parameter path (/aws/...) or ami-xxxx
     volume_type: gp3                       # EBS type for data volumes
     families: [g6, g6e, p5]                # instance families rig types lists
+tui:
+  theme: auto                          # auto | light — the dashboard's selection band;
+                                       # light is a pale band with dark text, for a
+                                       # light-themed terminal
 ssh:
   user: root                           # optional override of the provider's login user
   public_key: ~/.ssh/id_ed25519.pub

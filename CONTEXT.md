@@ -22,6 +22,11 @@ prefix (Vast.ai carries the name in the instance label).
 _Avoid_: box, machine, server, node, pod (RunPod's word for it — the driver maps, the docs and
 code say instance)
 
+**Fleet**:
+Every provider one config drives, opened lazily and surveyed together — what the dashboard shows
+and what a burn rate sums over. An `App` is one cloud; a `Fleet` is the whole estate.
+_Avoid_: cluster, estate (in code), group
+
 **Endpoint**:
 The host, port and user rig's ssh, rsync and tunnel commands connect to. A VM's is `IP:22`; a
 container's is a host-mapped port or the provider's proxy host, and it can move on restart.

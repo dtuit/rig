@@ -113,16 +113,18 @@ pod-scoped self-stop, down. AWS EC2 was live-verified the same day, on
 deleted on request) and on `g4dn.xlarge` (the Deep Learning AMI, Tesla T4):
 up, ssh, a job, `sync`, a tunnel, live prices, the watchdog under systemd,
 down. Spot launches and a deadline actually firing are the AWS parts still
-unexercised. The Vast.ai column describes a driver that is written and
-unit-tested against recorded API responses but has never talked to the live
-cloud (no billing method on the account), so read that one as what rig intends
-to do, not as observed behaviour.
+unexercised. On Vast.ai the read half has now
+talked to the live cloud — on 2026-09-09 the marketplace crawl, availability
+and the account balance all answered, and `rig types` renders them — but
+nothing has ever been rented there (no billing method on the account), so the
+launch, footprint and self-stop parts of that column are still what rig
+intends to do rather than observed behaviour.
 
 Marketplace type tokens are `<count>x<GPU name with spaces as dashes>`, and
 matching is case-insensitive, so `--type 1xrtx-4090` finds the same offers as
 `--type 1xRTX-4090`. What a cloud cannot do fails loudly rather than quietly:
 `spot: true` on RunPod and a `volume:` on Vast are refused before anything is
-created, and the dashboard hides the balance tile on AWS.
+created, and the dashboard shows no balance for AWS.
 
 **A RunPod restart wipes the footprint.** A pod's container disk is ephemeral,
 so a restart from the RunPod console or API — or a start after the watchdog
@@ -133,7 +135,8 @@ TTL as `-`. Run `rig adopt <name>` after any such restart.
 ## Use
 
 ```bash
-rig                      # dashboard TUI: provider, instances, volumes, burn rate, balance
+rig                      # dashboard TUI: every configured cloud's instances, volumes, burn rate, balance
+rig --provider vast      # dashboard for one cloud only
 rig up                   # interactive picker over LIVE availability + pricing
 rig up train             # headless: first available type from the profile
 rig up --type CPU.4V.16G --name smoke --ttl 1h   # fully ad-hoc
@@ -150,8 +153,9 @@ rig fetch s3://bucket/set.tar            # download ON the instance, not through
 rig tunnel 8000 50051    # forward local ports (^C to stop)
 
 rig run --name train -- bash train.sh   # detached tmux job, survives disconnect
-rig ps                   # running / exited jobs
-rig logs train -f        # follow the job log
+rig ps                   # jobs: latest run of each (--all for every recorded run)
+rig logs train -f        # follow the job log (--run <id> for an earlier run)
+rig logs --watchdog      # the TTL watchdog's own record: what it deferred, and why
 rig wait train           # block until it finishes; exit with ITS exit code (124 = --timeout)
 rig wait train --for 'stage: train'   # block until a log line matches; prints it (125 = job ended first)
 rig run --wait -- bash train.sh          # start + wait in one command
@@ -162,7 +166,59 @@ rig down                 # delete instance (+ its OS volume); prints lifetime + 
 rig down --delete-volumes  # ... and destroy data volumes too
 rig volumes              # list volumes; --rm <name> deletes a detached one
 rig spend --since 168h   # spend summary from the local ledger (advisory)
+rig spend -i train       # one instance's timeline: up, every extend, down and cost
 ```
+
+### The dashboard
+
+`rig` on its own opens the dashboard over **every provider the config knows**
+— each `providers:` block plus the default one — asking them in parallel. Rows
+carry a `PROVIDER` column whenever more than one cloud is in play, the burn
+rate sums across all of them, and each cloud's balance is named in the header.
+A cloud that cannot be reached (missing credentials, an expired token, an
+outage) gets one error line of its own and leaves the other clouds' rows
+alone. `rig --provider <name>` pins the dashboard to one cloud, as it pins
+every other command.
+
+| key | does |
+| --- | --- |
+| `↑`/`↓`, `k`/`j` | move the selection (scroll the log, on a run) |
+| `enter` | open the selected instance, then one of its runs |
+| `esc` | back up a level, with the selection and scroll where you left them |
+| `n` | create an instance: which cloud, then that cloud's picker |
+| `d` | delete the selected instance (confirms; data volumes are kept) |
+| `f` | on a run: follow its log live, leaving the dashboard until ctrl-C |
+| `s` | on a run: stop it |
+| `r` | refresh now (it also refreshes every 15s) |
+| `w` | split panes — instance list beside the detail, at 120 columns or wider |
+| `?` | every action, and what the columns mean |
+| `q` | quit |
+
+Three levels. The **instances** screen is five complete columns — INSTANCE, STATUS,
+`$/H`, SPENT, EXPIRES, JOBS — with the type, endpoint and location on the instance
+itself rather than truncated to fit beside them. `enter` opens an **instance**: what it
+is, its storage and what happens to each volume when the instance goes, and its runs.
+`enter` again opens a **run**: its command, how it went, and its log.
+
+Only the provider API is asked for the first paint, so the estate appears as fast as
+`rig status` does. EXPIRES and JOBS need the instance itself — one ssh each, shared
+between them — so they show `…` and fill in as the answers arrive. A stopped instance is
+never asked, because it cannot answer. One the cloud calls running but ssh cannot reach
+shows everything the API knows and says why the rest is missing: `running · no ssh`,
+an unreadable expiry, and the ssh error itself against its jobs with a `rig adopt` hint.
+"No jobs" and "could not ask" are never allowed to look alike.
+
+Columns are sized to their contents and fitted to the terminal: nothing runs off the
+side, a value too long for its column is clipped from the *middle* — names, mount paths
+and commands differ at the end — and on a narrow window columns are squeezed and then
+given up in a fixed order, cost last. The footer never clips a verb; anything that will
+not fit moves into `?`. Selection is a background band, so a failed run stays red on the
+row you are looking at, and `tui.theme: light` in the config swaps it for a pale band
+with dark text.
+
+`n` and `f` both leave the dashboard and come back: `n` runs the same picker `rig up`
+uses, `f` runs the same follower `rig logs -f` does, because the ssh that follows a log
+needs the terminal the dashboard is drawing on.
 
 `rig ssh -- <cmd>` exits with the remote command's exit code; 255 means ssh
 itself failed *or* the remote command killed its own connection (e.g. a bare
@@ -193,6 +249,14 @@ output shows only on a terminal running a single stream; `--quiet` drops it,
 - **Preference lists, not fixed types.** GPU availability is volatile.
   Profiles declare `types: [A, B, C]` and rig takes the first that is
   actually deployable, optionally pinned to a location.
+- **The watchdog writes down what it does.** Every deadline it defers, and
+  the job or `busy.d` hook it deferred for, goes to `~/.rig/ttl.log` with a
+  timestamp, along with arming and firing. `rig logs --watchdog` reads it.
+  That is what answers "why is this instance still up, hours past its TTL" —
+  before this, the deferral rewrote `~/.rig/deadline` silently and nothing
+  recorded the reason. The log is capped and lives in the same file whether
+  the watchdog runs under systemd or `nohup`, so reading it needs no
+  knowledge of which.
 - **TTL self-destruct.** `rig up` installs a systemd watchdog on the box
   that shuts it down when the deadline in `~/.rig/deadline` passes —
   deferring an hour at a time while any rig job is still running, or while
@@ -203,10 +267,16 @@ output shows only on a terminal running a single stream; `--quiet` drops it,
   re-armed on container start by `~/.rig/onstart.sh`; the line it runs at
   the deadline is the provider's self-stop call instead of `shutdown`
   (ADR-0008).
-- **Jobs are tmux sessions.** `rig run` wraps the command in a named tmux
-  session, logs to `~/.rig/logs/<name>.log`, records the exit code, and
-  sources every file in `~/.rig/env/` first. Nothing depends on your laptop
-  staying connected.
+- **Jobs are tmux sessions, and every run is written down.** `rig run` wraps
+  the command in a named tmux session, sources every file in `~/.rig/env/`
+  first, and logs to `~/.rig/logs/<name>.<run>.log` with `<name>.log`
+  pointing at the current run. Each run appends its start and its exit code
+  to `~/.rig/jobs.jsonl`, so retrying a job no longer destroys the log of
+  the run you are retrying: `rig ps` shows the latest run of each job,
+  `rig ps --all` every run it has, and `rig logs <job> --run <id>` an
+  earlier one. A run the record never saw finish — the instance stopped
+  under it — reads as `interrupted`, not as exited. Nothing depends on your
+  laptop staying connected.
 - **No long-lived credentials at rest on instances.** SSH agent forwarding
   handles private git dependencies (`git+ssh` installs); secrets arrive only
   as explicitly pushed env files. `rig fetch s3://…` forwards short-lived

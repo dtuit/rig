@@ -2,15 +2,21 @@
 package cli
 
 import (
+	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"os/signal"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/dtuit/rig/internal/config"
 	"github.com/dtuit/rig/internal/core"
 	"github.com/dtuit/rig/internal/provider"
+	"github.com/dtuit/rig/internal/remote"
 	"github.com/dtuit/rig/internal/tui"
 
 	// drivers register themselves with the provider registry on import
@@ -84,6 +90,127 @@ func configForDisplay() *config.Config {
 	return cfg
 }
 
+// dashboard opens the overview UI over the providers this invocation is
+// about, and runs the launch flow whenever the user asks for one from it.
+// The loop lives here rather than in tui because a launch needs the plain
+// terminal the picker and the launch log want, and because `rig up`'s own
+// closing summary is this package's to print.
+func dashboard(ctx context.Context) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	fleet := core.NewFleet(cfg, stderrLogf, dashboardProviders(cfg)...)
+	for {
+		res, err := tui.Dashboard(ctx, fleet)
+		if err != nil {
+			return err
+		}
+		switch res.Outcome {
+		case tui.Create:
+			in, err := createFromDashboard(ctx, fleet)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "rig:", err)
+			}
+			// A cancelled picker leaves nothing to read, so it goes
+			// straight back; a launch or a failure has output the user
+			// has to see before the alt screen paints over it.
+			if in != nil || err != nil {
+				pause()
+			}
+		case tui.FollowLog:
+			// The dashboard cannot follow a log itself: the ssh that does
+			// it attaches this process's stdout. So it hands the job back
+			// here, exactly as it hands back a create, and ctrl-C on the
+			// follower returns to the dashboard.
+			if err := followFromDashboard(ctx, fleet, res); err != nil {
+				fmt.Fprintln(os.Stderr, "rig:", err)
+				pause()
+			}
+		default:
+			return nil
+		}
+	}
+}
+
+// dashboardProviders is which clouds the dashboard shows: just the one
+// --provider pins, as it pins every other command, and otherwise every
+// provider the config knows — the estate a burn rate has to cover.
+func dashboardProviders(cfg *config.Config) []string {
+	if providerFlag != "" {
+		return []string{providerFlag}
+	}
+	return core.ProviderNames(cfg)
+}
+
+// followFromDashboard tails one run's log until the user interrupts it,
+// which is what returns them to the dashboard. An interrupt is the expected
+// ending, so it is not an error.
+func followFromDashboard(ctx context.Context, fleet *core.Fleet, res tui.Result) error {
+	if res.Instance == nil {
+		return nil
+	}
+	app, err := fleet.FindApp(*res.Instance)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("following %s on %s — ctrl-C returns to the dashboard\n\n",
+		res.Job.Name, strings.TrimPrefix(res.Instance.Name, core.HostPrefix))
+	// ctrl-C reaches every process in the foreground group, so without
+	// this it kills rig and the promise above is a lie. Notify, not
+	// Ignore: a handler is reset to the default across exec, so the ssh
+	// child still dies on the interrupt, while SIG_IGN would be inherited
+	// and ctrl-C would do nothing at all.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	defer signal.Stop(sig)
+	err = remote.TailRunLog(app.Target(res.Instance), res.Job, true, 200)
+	if err != nil && ctx.Err() == nil && !isInterrupt(err) {
+		return err
+	}
+	return nil
+}
+
+// isInterrupt spots the ssh exit that ctrl-C produces, so quitting the
+// follower does not print an error on the way back.
+func isInterrupt(err error) bool {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		// 130 is the shell's SIGINT convention; ssh passes it through
+		return ee.ExitCode() == 130 || ee.ExitCode() == 255
+	}
+	return false
+}
+
+func pause() {
+	fmt.Print("\npress enter to return to the dashboard ")
+	bufio.NewReader(os.Stdin).ReadString('\n')
+}
+
+// createFromDashboard runs one launch: which cloud (when the fleet drives
+// several), then that cloud's picker, then the launch itself. A cancelled
+// picker is neither an instance nor an error.
+func createFromDashboard(ctx context.Context, fleet *core.Fleet) (*provider.Instance, error) {
+	name, err := tui.PickProvider(fleet.Names(), fleet.Cfg.Provider)
+	if err != nil || name == "" {
+		return nil, err
+	}
+	a, err := fleet.App(name)
+	if err != nil {
+		return nil, err
+	}
+	spec, err := tui.Picker(ctx, a)
+	if err != nil || spec == nil {
+		return nil, err
+	}
+	in, err := a.Up(ctx, *spec)
+	if err != nil {
+		return nil, err
+	}
+	printUp(in)
+	return in, nil
+}
+
 // stderrLogf is the CLI's shared progress logger: rig-prefixed, on stderr.
 func stderrLogf(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "rig: "+format+"\n", a...)
@@ -97,11 +224,7 @@ func NewRoot() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			a, err := newApp()
-			if err != nil {
-				return err
-			}
-			return tui.Dashboard(cmd.Context(), a)
+			return dashboard(cmd.Context())
 		},
 	}
 	root.PersistentFlags().StringVarP(&instanceFlag, "instance", "i", "", "target instance name or ID prefix")

@@ -100,10 +100,7 @@ func newUpCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			short := strings.TrimPrefix(in.Name, core.HostPrefix)
-			fmt.Printf("\n%s is up: %s (%s, $%.2f/h%s) in %s\n", short, in.IP, in.Type,
-				in.PricePerHour, spotTag(in.Spot), in.Location)
-			fmt.Printf("  rig ssh -i %s\n  rig run -i %s -- <cmd>\n", short, short)
+			printUp(in)
 			return nil
 		},
 	}
@@ -117,6 +114,15 @@ func newUpCmd() *cobra.Command {
 	cmd.Flags().IntVar(&volSize, "volume-size", 100, "size GB when creating --volume")
 	cmd.Flags().StringArrayVar(&envFiles, "env-file", nil, "KEY=VALUE file to push to the instance, repeatable (stacks on the profile's env_files)")
 	return cmd
+}
+
+// printUp is what a finished launch says, wherever the launch came from:
+// `rig up`, a profile, or the dashboard's n.
+func printUp(in *provider.Instance) {
+	short := strings.TrimPrefix(in.Name, core.HostPrefix)
+	fmt.Printf("\n%s is up: %s (%s, $%.2f/h%s) in %s\n", short, in.IP, in.Type,
+		in.PricePerHour, spotTag(in.Spot), in.Location)
+	fmt.Printf("  rig ssh -i %s\n  rig run -i %s -- <cmd>\n", short, short)
 }
 
 func newDownCmd() *cobra.Command {

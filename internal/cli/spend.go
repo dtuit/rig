@@ -28,6 +28,12 @@ marked with ~.`,
 			if err != nil {
 				return err
 			}
+			// -i asks a different question: not what the estate cost, but
+			// what happened to this instance and when. Same ledger, and
+			// still no provider call.
+			if instanceFlag != "" {
+				return printInstanceHistory(events, instanceFlag)
+			}
 			var cutoff time.Time
 			if since > 0 {
 				cutoff = time.Now().Add(-since)
@@ -96,4 +102,44 @@ marked with ~.`,
 	}
 	cmd.Flags().DurationVar(&since, "since", 0, "only spend that ended within this window, e.g. 168h (default: all)")
 	return cmd
+}
+
+// printInstanceHistory prints one instance's lifecycle: every up, extend and
+// down the ledger holds for it. Advisory like the rest of the ledger — an
+// instance the watchdog tore down has no down event, and says so.
+func printInstanceHistory(events []ledger.Event, name string) error {
+	own := ledger.EventsFor(events, name)
+	if jsonFlag {
+		return renderJSON(own)
+	}
+	if len(own) == 0 {
+		fmt.Printf("no ledger events for %s\n", name)
+		return nil
+	}
+	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "WHEN\tEVENT\tDETAIL")
+	var openedAt time.Time
+	closed := false
+	for _, e := range own {
+		detail := ""
+		switch e.Event {
+		case "up":
+			openedAt, closed = e.Time, false
+			detail = fmt.Sprintf("%s in %s, $%.2f/h%s, ttl %s",
+				e.Type, e.Location, e.PricePerHour, spotTag(e.Spot), e.TTL)
+		case "extend":
+			detail = "deadline " + e.Deadline.Local().Format("Jan 02 15:04")
+		case "down":
+			closed = true
+			detail = fmt.Sprintf("lived %.1fh, cost $%.2f",
+				(time.Duration(e.LifetimeSecs) * time.Second).Hours(), e.Cost)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\n", e.Time.Local().Format("Jan 02 15:04"), e.Event, detail)
+	}
+	w.Flush()
+	if !openedAt.IsZero() && !closed {
+		fmt.Printf("\nstill open since %s (%.1fh) — no down event; the watchdog leaves none\n",
+			openedAt.Local().Format("Jan 02 15:04"), time.Since(openedAt).Hours())
+	}
+	return nil
 }

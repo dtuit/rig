@@ -36,6 +36,13 @@ type Provider struct {
 	// whose host-mapped port moved on restart. Unscripted instances report
 	// their IP on port 22 as root, like a VM.
 	SSH map[string]provider.Endpoint
+	// ListErr is returned by ListInstances instead of a listing: the cloud
+	// that cannot be asked at all (bad credentials, an outage), which a
+	// caller surveying several has to survive.
+	ListErr error
+	// Bal is what Balance reports, in Cur; the zero value is 42 USD.
+	Bal float64
+	Cur string
 
 	// Requests records every CreateInstanceRequest received, in order.
 	Requests []provider.CreateInstanceRequest
@@ -112,6 +119,9 @@ func (p *Provider) Images(_ context.Context, instanceType string) ([]provider.Im
 }
 
 func (p *Provider) ListInstances(context.Context) ([]provider.Instance, error) {
+	if p.ListErr != nil {
+		return nil, p.ListErr
+	}
 	ids := make([]string, 0, len(p.instances))
 	for id := range p.instances {
 		ids = append(ids, id)
@@ -180,6 +190,18 @@ func (p *Provider) CreateInstance(_ context.Context, req provider.CreateInstance
 	p.instances[in.ID] = in
 	copy := *in
 	return &copy, nil
+}
+
+// Put places in into the fake as an instance the cloud already holds —
+// the one a listing finds that the test did not create through
+// CreateInstance, with the age, price and location the test needs it to
+// have.
+func (p *Provider) Put(in provider.Instance) {
+	if p.instances == nil {
+		p.instances = map[string]*provider.Instance{}
+	}
+	p.instances[in.ID] = &in
+	p.Statuses[in.ID] = []provider.Status{in.Status}
 }
 
 func (p *Provider) DeleteInstance(_ context.Context, id string, deleteVolumeIDs []string) error {
@@ -273,6 +295,9 @@ func (p *Provider) EnsureSSHKey(context.Context, string, string) (string, error)
 func (p *Provider) Balance(context.Context) (float64, string, error) {
 	if !p.Caps.Balance {
 		return 0, "", fmt.Errorf("fake has no balance: %w", provider.ErrUnsupported)
+	}
+	if p.Bal != 0 || p.Cur != "" {
+		return p.Bal, p.Cur, nil
 	}
 	return 42, "USD", nil
 }

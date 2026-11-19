@@ -132,6 +132,22 @@ func (t InstanceType) MemoryText() string {
 	return fmt.Sprintf("%dGB", t.MemoryGB)
 }
 
+// PriceText renders an hourly price for a human column. A price of zero is
+// a price the cloud did not quote, not a free instance: AWS lists
+// p5e.48xlarge with spot history but no on-demand price at all, because it
+// sells that capacity only through Capacity Blocks, and "0.00" in the $/H
+// column reads as free. Rendering it as a dash beside a real SPOT$/H says
+// what is true — this shape is not for rent by the hour on demand.
+func PriceText(usdPerHour float64) string {
+	if usdPerHour == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.2f", usdPerHour)
+}
+
+// PriceText is the type's on-demand price as a human column. See PriceText.
+func (t InstanceType) PriceText() string { return PriceText(t.PricePerHour) }
+
 type Volume struct {
 	ID           string   `json:"id"`
 	Name         string   `json:"name"`

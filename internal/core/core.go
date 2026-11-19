@@ -38,8 +38,22 @@ func (a *App) logf(format string, args ...any) {
 }
 
 // Managed returns rig-managed instances (hostname prefix), newest first,
-// each tagged with this App's provider.
+// each tagged with this App's provider, and reconciles the instance cache
+// against the listing.
 func (a *App) Managed(ctx context.Context) ([]provider.Instance, error) {
+	out, err := a.managed(ctx)
+	if err != nil {
+		return nil, err
+	}
+	a.reconcile(out)
+	return out, nil
+}
+
+// managed is Managed without the cache write, so a caller listing several
+// providers at once can fan the provider calls out in parallel and reconcile
+// serially afterwards: instcache saves the whole file, and two goroutines
+// doing read-modify-write on it would lose one another's updates.
+func (a *App) managed(ctx context.Context) ([]provider.Instance, error) {
 	all, err := a.Prov.ListInstances(ctx)
 	if err != nil {
 		return nil, err
@@ -54,12 +68,16 @@ func (a *App) Managed(ctx context.Context) ([]provider.Instance, error) {
 	slices.SortFunc(out, func(x, y provider.Instance) int {
 		return y.CreatedAt.Compare(x.CreatedAt)
 	})
-	// a fresh listing is the one moment stale cache entries can be caught —
-	// this provider's entries; the listing says nothing about other clouds'
-	if err := instcache.Reconcile(instcache.Path(), a.Provider(), out, time.Now()); err != nil {
+	return out, nil
+}
+
+// reconcile tells the cache what this provider's listing just said. A fresh
+// listing is the one moment stale entries can be caught — this provider's
+// entries; the listing says nothing about other clouds'.
+func (a *App) reconcile(instances []provider.Instance) {
+	if err := instcache.Reconcile(instcache.Path(), a.Provider(), instances, time.Now()); err != nil {
 		a.logf("warning: instance cache: %v", err)
 	}
-	return out, nil
 }
 
 // stamp tags in with the provider it came from. Drivers do not know rig's
@@ -726,6 +744,36 @@ func (a *App) MountVolume(ctx context.Context, t sshx.Target, volID string) erro
 // instance, but billed if left behind). Data volumes are kept unless
 // deleteVolumes. The returned event is the ledger record — lifetime and
 // cost — so callers report the same numbers the ledger keeps.
+// Snapshot asks one instance for its deadline and its jobs — the ssh half
+// of what the dashboard shows, in a single round trip. Only the caller
+// knows whether an instance is worth asking: a stopped one cannot answer,
+// and waiting out its connect timeout is worse than showing nothing.
+func (a *App) Snapshot(in *provider.Instance) (remote.Snapshot, error) {
+	return remote.InstanceSnapshot(a.Target(in))
+}
+
+// JobLog is the tail of one run's log, as text.
+func (a *App) JobLog(in *provider.Instance, j remote.Job, lines int) ([]string, error) {
+	return remote.JobLogTail(a.Target(in), j, lines)
+}
+
+// WatchdogLog is what the TTL watchdog has written down on the instance.
+func (a *App) WatchdogLog(in *provider.Instance, lines int) ([]string, error) {
+	return remote.WatchdogLog(a.Target(in), lines)
+}
+
+// History is one instance's ledger events, oldest first. Local only — no
+// provider call and no ssh — so it is the one part of an instance's detail
+// that is there even when the instance is not.
+func (a *App) History(in *provider.Instance) []ledger.Event {
+	events, err := ledger.Read(ledger.Path())
+	if err != nil {
+		a.logf("warning: spend ledger: %v", err)
+		return nil
+	}
+	return ledger.EventsFor(events, in.Name)
+}
+
 func (a *App) Down(ctx context.Context, in *provider.Instance, deleteVolumes bool) (ledger.Event, error) {
 	a.stamp(in) // the ledger event must say which cloud billed this
 	if err := a.Prov.DeleteInstance(ctx, in.ID, volumesToDelete(in, deleteVolumes)); err != nil {

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/dtuit/rig/internal/config"
@@ -133,6 +134,40 @@ type Line struct {
 	Closed    bool      `json:"closed"`    // a down event was recorded
 	Estimated bool      `json:"estimated"` // no down event: cost estimated through the TTL
 }
+
+// EventsFor is one instance's lifecycle from the ledger, oldest first:
+// every up, extend and down recorded under that name. It answers the
+// questions a spend summary cannot — when was this extended, and how many
+// times — and it costs no provider call, which is why the dashboard can
+// show it beside an instance without asking the cloud anything.
+//
+// The name may be given with or without the rig- hostname prefix, as every
+// other command accepts it. Matching on the name rather than the ID is
+// deliberate: a volume-backed instance relaunched under the same name is
+// the same piece of work to its operator, and its history should read as
+// one story.
+func EventsFor(events []Event, name string) []Event {
+	if name == "" {
+		return nil
+	}
+	// ledger writes the hostname; -i takes either spelling
+	full := name
+	if !strings.HasPrefix(name, hostPrefix) {
+		full = hostPrefix + name
+	}
+	var out []Event
+	for _, e := range events {
+		if e.Name == name || e.Name == full {
+			out = append(out, e)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.Before(out[j].Time) })
+	return out
+}
+
+// hostPrefix is core.HostPrefix, spelled again here because core imports
+// this package and not the other way round.
+const hostPrefix = "rig-"
 
 // Summarize pairs up/down events by instance ID. A closed instance reports
 // its recorded cost; an unclosed one (still running, or TTL-torn without a

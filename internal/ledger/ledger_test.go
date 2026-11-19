@@ -160,3 +160,50 @@ func TestEventsCarryProvider(t *testing.T) {
 		t.Errorf("unclosed lines = %+v, want one runpod line", lines)
 	}
 }
+
+func TestEventsForOneInstanceOldestFirst(t *testing.T) {
+	base := time.Date(2026, 9, 9, 1, 0, 0, 0, time.UTC)
+	events := []Event{
+		{Event: "up", Time: base.Add(2 * time.Hour), Name: "rig-other", Provider: "verda"},
+		{Event: "down", Time: base.Add(3 * time.Hour), Name: "rig-trainer", Provider: "verda", Cost: 12.5},
+		{Event: "up", Time: base, Name: "rig-trainer", Provider: "verda", Type: "1H100.80S.32V"},
+		{Event: "extend", Time: base.Add(time.Hour), Name: "rig-trainer", Provider: "verda"},
+	}
+
+	// the name is accepted with or without the hostname prefix, as -i is
+	for _, key := range []string{"trainer", "rig-trainer"} {
+		got := EventsFor(events, key)
+		if len(got) != 3 {
+			t.Fatalf("EventsFor(%q) = %d events, want 3: %+v", key, len(got), got)
+		}
+		if got[0].Event != "up" || got[1].Event != "extend" || got[2].Event != "down" {
+			t.Errorf("EventsFor(%q) out of order: %s %s %s",
+				key, got[0].Event, got[1].Event, got[2].Event)
+		}
+		for _, e := range got {
+			if e.Name != "rig-trainer" {
+				t.Errorf("picked up %s", e.Name)
+			}
+		}
+	}
+	if got := EventsFor(events, "nonesuch"); got != nil {
+		t.Errorf("want nothing for an unknown instance, got %+v", got)
+	}
+	if got := EventsFor(events, ""); got != nil {
+		t.Errorf("an empty name must not match every instance, got %d", len(got))
+	}
+}
+
+// A relaunch under the same name is one story to its operator, so both
+// runs' events come back together.
+func TestEventsForSpansARelaunchOfTheSameName(t *testing.T) {
+	base := time.Date(2026, 9, 9, 1, 0, 0, 0, time.UTC)
+	events := []Event{
+		{Event: "up", Time: base, ID: "a", Name: "rig-trainer"},
+		{Event: "down", Time: base.Add(time.Hour), ID: "a", Name: "rig-trainer"},
+		{Event: "up", Time: base.Add(2 * time.Hour), ID: "b", Name: "rig-trainer"},
+	}
+	if got := EventsFor(events, "trainer"); len(got) != 3 {
+		t.Errorf("want all three, got %+v", got)
+	}
+}

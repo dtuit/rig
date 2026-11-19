@@ -126,11 +126,22 @@ func (p ProviderConfig) Creds(envNames []string) (map[string]string, error) {
 	return out, nil
 }
 
+// TUI is the dashboard's own settings.
+type TUI struct {
+	// Theme picks the selection band: "dark" (light text on a dark band),
+	// "light" (dark text on a pale band), or "auto". Auto is a *fixed*
+	// mid-tone palette that reads on either background, not a guess —
+	// terminal background detection fails silently, and a wrong guess makes
+	// the selected row unreadable, so it is offered as a setting instead.
+	Theme string `yaml:"theme"`
+}
+
 type Config struct {
 	Provider        string                    `yaml:"provider"`         // default provider; verda when unset
 	CredentialsFile string                    `yaml:"credentials_file"` // legacy: Verda's credentials file
 	Providers       map[string]ProviderConfig `yaml:"providers"`
 	SSH             SSH                       `yaml:"ssh"`
+	TUI             TUI                       `yaml:"tui"`
 	Defaults        Defaults                  `yaml:"defaults"`
 	Profiles        map[string]Profile        `yaml:"profiles"`
 

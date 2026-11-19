@@ -89,3 +89,22 @@ func TestUnknownProviderNamesRegistered(t *testing.T) {
 		t.Errorf("err = %v\nwant %s", err, want)
 	}
 }
+
+func TestDashboardShowsEveryConfiguredProviderUnlessPinned(t *testing.T) {
+	cfg := &config.Config{
+		Provider: "verda",
+		Providers: map[string]config.ProviderConfig{
+			"verda": {}, "runpod": {}, "aws": {},
+		},
+	}
+	defer func() { providerFlag = "" }()
+
+	providerFlag = ""
+	if got := dashboardProviders(cfg); strings.Join(got, ",") != "verda,aws,runpod" {
+		t.Errorf("unpinned dashboard covers %v, want every provider with the default first", got)
+	}
+	providerFlag = "runpod"
+	if got := dashboardProviders(cfg); strings.Join(got, ",") != "runpod" {
+		t.Errorf("--provider runpod gave %v, want just runpod", got)
+	}
+}

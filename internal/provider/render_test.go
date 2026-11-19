@@ -52,3 +52,23 @@ func TestInstanceTypeMemoryText(t *testing.T) {
 		t.Errorf("MemoryText() = %q, want -", got)
 	}
 }
+
+func TestPriceTextCallsAnUnquotedPriceADash(t *testing.T) {
+	// AWS quotes spot history but no on-demand price for the shapes it
+	// sells only through Capacity Blocks; 0.00 in a $/H column reads free.
+	for _, tc := range []struct {
+		price float64
+		want  string
+	}{
+		{0, "-"},
+		{0.53, "0.53"},
+		{82.275, "82.28"},
+	} {
+		if got := provider.PriceText(tc.price); got != tc.want {
+			t.Errorf("PriceText(%v) = %q, want %q", tc.price, got, tc.want)
+		}
+		if got := (provider.InstanceType{PricePerHour: tc.price}).PriceText(); got != tc.want {
+			t.Errorf("InstanceType{%v}.PriceText() = %q, want %q", tc.price, got, tc.want)
+		}
+	}
+}

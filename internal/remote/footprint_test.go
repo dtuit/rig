@@ -1,6 +1,8 @@
 package remote
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,7 +26,7 @@ func TestRenderTTLScriptSelfStopLine(t *testing.T) {
 	if strings.Contains(def, ttlSelfStopPlaceholder) {
 		t.Errorf("placeholder leaked into the rendered script")
 	}
-	for _, want := range []string{"#!/usr/bin/env bash", `DIR="${RIG_DIR:-${HOME:-/root}/.rig}"`, "rig_jobs_running", "/tmp/tmux-*/default", `"$DIR"/busy.d/*`, "logger -t rig-ttl"} {
+	for _, want := range []string{"#!/usr/bin/env bash", `DIR="${RIG_DIR:-${HOME:-/root}/.rig}"`, "rig_jobs_running", "/tmp/tmux-*/default", `"$DIR"/busy.d/*`, "logger -t rig-ttl", "ttl_log", `LOG="$DIR/ttl.log"`} {
 		if !strings.Contains(def, want) {
 			t.Errorf("default script lacks %q", want)
 		}
@@ -68,7 +70,9 @@ func TestRenderOnstartRearmsWatchdog(t *testing.T) {
 	s := RenderOnstart()
 	for _, want := range []string{
 		"#!/usr/bin/env bash",
-		"nohup setsid ~/.rig/ttl.sh >~/.rig/ttl.log 2>&1 & echo $! > ~/.rig/ttl.pid",
+		// >> not >: a container restart must not truncate the decision log
+		// the watchdog keeps in that same file.
+		"nohup setsid ~/.rig/ttl.sh >>~/.rig/ttl.log 2>&1 & echo $! > ~/.rig/ttl.pid",
 		"/proc/$p/cmdline",
 	} {
 		if !strings.Contains(s, want) {
@@ -177,7 +181,9 @@ func TestInitWithoutSystemdUsesNohupAndPidfile(t *testing.T) {
 	}
 	cmds := string(b)
 	for _, want := range []string{
-		"nohup setsid ~/.rig/ttl.sh >~/.rig/ttl.log 2>&1 & echo $! > ~/.rig/ttl.pid",
+		// >> not >: a container restart must not truncate the decision log
+		// the watchdog keeps in that same file.
+		"nohup setsid ~/.rig/ttl.sh >>~/.rig/ttl.log 2>&1 & echo $! > ~/.rig/ttl.pid",
 		"/proc/$p/cmdline",
 		"kill",
 		"cat > ~/.rig/onstart.sh",
@@ -210,5 +216,78 @@ func TestInitWithSystemdInstallsUnit(t *testing.T) {
 	}
 	if strings.Contains(cmds, "nohup") || strings.Contains(cmds, "onstart.sh") {
 		t.Errorf("systemd box must not use the nohup fallback:\n%s", cmds)
+	}
+}
+
+// The watchdog's record is the answer to "why is this instance still up",
+// and it is shell, so it is tested by running it: a real bash against a
+// fake RIG_DIR, with the poll interval turned down.
+func runWatchdog(t *testing.T, dir string, wait time.Duration) string {
+	t.Helper()
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("no bash on PATH")
+	}
+	script := filepath.Join(dir, "ttl.sh")
+	// "exit 0" stands in for the self-stop line: the test must not run
+	// `shutdown -h now` on the machine running the test.
+	if err := os.WriteFile(script, []byte(RenderTTLScript("exit 0")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	c := exec.CommandContext(ctx, "bash", script)
+	c.Env = append(os.Environ(), "RIG_DIR="+dir, "RIG_TTL_POLL=1")
+	c.Run() // it either self-stops or is killed by the deadline; both are fine
+	b, err := os.ReadFile(filepath.Join(dir, "ttl.log"))
+	if err != nil {
+		t.Fatalf("the watchdog wrote no log: %v", err)
+	}
+	return string(b)
+}
+
+func TestWatchdogRecordsWhyItDeferred(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "busy.d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// a deadline already passed, and a hook that says the box is busy
+	if err := os.WriteFile(filepath.Join(dir, "deadline"),
+		[]byte(fmt.Sprint(time.Now().Add(-time.Minute).Unix())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "busy.d", "keepalive"),
+		[]byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	log := runWatchdog(t, dir, 4*time.Second)
+
+	for _, want := range []string{"watchdog started", "armed for", "deferred 1h", "busy.d/keepalive"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("log does not say %q:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, "deadline reached") {
+		t.Errorf("it stopped an instance a hook said was busy:\n%s", log)
+	}
+	// the deferral has to move the deadline, not just talk about it
+	b, _ := os.ReadFile(filepath.Join(dir, "deadline"))
+	moved, _ := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if moved <= time.Now().Unix() {
+		t.Errorf("deadline is still in the past: %d", moved)
+	}
+}
+
+func TestWatchdogRecordsFiring(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "deadline"),
+		[]byte(fmt.Sprint(time.Now().Add(-time.Minute).Unix())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	log := runWatchdog(t, dir, 6*time.Second)
+
+	if !strings.Contains(log, "deadline reached, stopping the instance") {
+		t.Errorf("nothing recorded the stop:\n%s", log)
 	}
 }

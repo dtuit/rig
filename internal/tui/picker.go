@@ -12,6 +12,7 @@ import (
 
 	"github.com/dtuit/rig/internal/config"
 	"github.com/dtuit/rig/internal/core"
+	"github.com/dtuit/rig/internal/provider"
 )
 
 // Picker walks the user through composing an UpSpec from live availability.
@@ -71,8 +72,15 @@ func Picker(ctx context.Context, a *core.App) (*core.UpSpec, error) {
 		// columns because a driver's marker belongs at the end of it —
 		// Vast's "2 offers (bid only)", the shape no on-demand rental can
 		// have — and clipping to 14 cut exactly that away.
-		label := fmt.Sprintf("%-16s %-14s %-6s $%-7.2f %-20s %s",
-			t.Type, clip(gpu, 14), t.MemoryText(), price, clip(t.Description, 20), locsText(locs))
+		// A price the cloud did not quote is a dash, not $0.00 (see
+		// provider.PriceText): AWS quotes no on-demand price at all for
+		// the shapes it sells only through Capacity Blocks.
+		priceCell := provider.PriceText(price)
+		if price != 0 {
+			priceCell = "$" + priceCell
+		}
+		label := fmt.Sprintf("%-16s %-14s %-6s %-8s %-20s %s",
+			t.Type, clip(gpu, 14), t.MemoryText(), priceCell, clip(t.Description, 20), locsText(locs))
 		typeOpts = append(typeOpts, huh.NewOption(strings.TrimRight(label, " "), t.Type))
 	}
 	if len(typeOpts) == 0 {
@@ -176,6 +184,36 @@ func Picker(ctx context.Context, a *core.App) (*core.UpSpec, error) {
 	}, nil
 }
 
+// PickProvider asks which cloud to launch on, defaulting to dflt. One
+// provider needs no question and is returned as it stands; an abort answers
+// "" with no error, as the rest of the picker does.
+func PickProvider(names []string, dflt string) (string, error) {
+	if len(names) == 0 {
+		return "", fmt.Errorf("no providers configured")
+	}
+	if len(names) == 1 {
+		return names[0], nil
+	}
+	choice := dflt
+	if !slices.Contains(names, choice) {
+		choice = names[0]
+	}
+	opts := make([]huh.Option[string], 0, len(names))
+	for _, n := range names {
+		label := n
+		if n == dflt {
+			label += " (default)"
+		}
+		opts = append(opts, huh.NewOption(label, n))
+	}
+	if err := run(huh.NewSelect[string]().
+		Title("Which cloud?").
+		Options(opts...).Value(&choice).Height(10)); err != nil {
+		return "", abortToNil(err)
+	}
+	return choice, nil
+}
+
 func pickVolume(ctx context.Context, a *core.App, loc string) (*config.VolumeSpec, error) {
 	vols, err := a.Prov.ListVolumes(ctx)
 	if err != nil {
@@ -216,16 +254,6 @@ func pickVolume(ctx context.Context, a *core.App, loc string) (*config.VolumeSpe
 		}
 		return nil, fmt.Errorf("volume %q vanished", choice)
 	}
-}
-
-// clip shortens s to n display columns so one long provider string cannot
-// push every column after it off the line.
-func clip(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n-1]) + "…"
 }
 
 // locsText names where a type is available, compactly: the whole list when it
